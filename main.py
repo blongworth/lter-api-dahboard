@@ -7,6 +7,7 @@ from urllib.request import Request, urlopen
 
 import altair as alt
 import plotly.express as px
+import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
@@ -38,6 +39,7 @@ IDENTIFIER_COLUMNS = {
 }
 DATETIME_COLUMNS = {"start_time", "end_time", "date", "dateTime8601"}
 PLOT_EXCLUDE_COLUMNS = {"latitude", "longitude", "depth", "cast", "niskin"}
+BATHYMETRY_POINT_LIMIT = 8_000
 
 st.set_page_config(page_title="NES-LTER API dashboard", layout="wide")
 
@@ -130,6 +132,17 @@ def join_bottle_summary_depth(cruise: str, bottles: pl.DataFrame) -> pl.DataFram
     return joined
 
 
+@st.cache_data(ttl="1h", max_entries=5, show_spinner=False)
+def load_bathymetry() -> pl.DataFrame:
+    try:
+        return normalize_dataframe(fetch_csv("ctd/bathymetry_file.csv"))
+    except RuntimeError:
+        # The API advertises this endpoint, but it can return 404 if the server-side
+        # bathymetry file is not mounted. Keep the dashboard usable and surface a
+        # notice in the map instead of failing the whole app.
+        return pl.DataFrame()
+
+
 @st.cache_data(ttl="1h", max_entries=30, show_spinner=False)
 def load_dataset(cruise_names: tuple[str, ...], dataset: str) -> pl.DataFrame:
     endpoint = DATASETS[dataset]
@@ -143,6 +156,50 @@ def load_dataset(cruise_names: tuple[str, ...], dataset: str) -> pl.DataFrame:
         except RuntimeError:
             continue
     return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+
+
+def find_geospatial_columns(df: pl.DataFrame) -> tuple[str | None, str | None, str | None]:
+    lower_to_name = {name.lower(): name for name in df.columns}
+    latitude = next((lower_to_name[name] for name in ["latitude", "lat", "y"] if name in lower_to_name), None)
+    longitude = next((lower_to_name[name] for name in ["longitude", "lon", "long", "x"] if name in lower_to_name), None)
+    depth = next(
+        (lower_to_name[name] for name in ["depth", "bathymetry", "elevation", "z"] if name in lower_to_name),
+        None,
+    )
+    if depth is None:
+        numeric = [name for name in numeric_columns(df) if name not in {latitude, longitude}]
+        depth = numeric[0] if numeric else None
+    return latitude, longitude, depth
+
+
+def surface_observations(data_df: pl.DataFrame, variable: str) -> pl.DataFrame:
+    required = {"cruise", "cast", "depth", variable}
+    if data_df.is_empty() or not required.issubset(data_df.columns):
+        return pl.DataFrame()
+
+    return (
+        data_df.select(["cruise", "cast", "depth", variable])
+        .drop_nulls(["cruise", "cast", "depth", variable])
+        .with_columns(pl.col("cast").cast(pl.Utf8))
+        .sort("depth")
+        .group_by(["cruise", "cast"], maintain_order=True)
+        .first()
+        .rename({"depth": "sample_depth"})
+    )
+
+
+def add_surface_variable(casts_df: pl.DataFrame, data_df: pl.DataFrame, variable: str) -> pl.DataFrame:
+    surface_df = surface_observations(data_df, variable)
+    if surface_df.is_empty() or not {"cruise_name", "number"}.issubset(casts_df.columns):
+        return casts_df
+
+    left = casts_df.with_columns(
+        [
+            pl.col("cruise_name").alias("cruise"),
+            pl.col("number").cast(pl.Utf8).alias("cast"),
+        ]
+    )
+    return left.join(surface_df, on=["cruise", "cast"], how="left").drop(["cruise", "cast"])
 
 
 def cruises_in_date_range(cruise_df: pl.DataFrame, start: date, end: date) -> list[str]:
@@ -175,27 +232,94 @@ def render_metrics(summary: pl.DataFrame, casts_df: pl.DataFrame, data_df: pl.Da
         st.metric("Date span", date_label, border=True)
 
 
-def render_track(casts_df: pl.DataFrame) -> None:
+def render_track(casts_df: pl.DataFrame, bathymetry_df: pl.DataFrame, data_df: pl.DataFrame, dataset: str) -> None:
     with st.container(border=True):
-        st.subheader("Cruise track and station locations")
+        st.subheader("Cruise track, stations, and bathymetry")
         if casts_df.is_empty() or not {"latitude", "longitude"}.issubset(casts_df.columns):
             st.warning("No cast location data were available for the selected cruise(s).")
             return
 
+        surface_variables = numeric_columns(data_df, exclude=PLOT_EXCLUDE_COLUMNS) if not data_df.is_empty() else []
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            color_choice = st.selectbox(
+                "Color stations by",
+                ["Cruise"] + surface_variables,
+                key="map_surface_variable",
+                help="Surface values use the shallowest available sample for each cast/station.",
+            )
+            show_bathymetry = st.toggle("Show bathymetry", value=True, key="show_bathymetry")
+
         casts_plot = casts_df.drop_nulls(["latitude", "longitude"])
-        hover_cols = [c for c in ["cruise_name", "number", "start_time", "depth"] if c in casts_plot.columns]
-        fig = px.line_map(
+        color_column = "cruise_name"
+        if color_choice != "Cruise":
+            casts_plot = add_surface_variable(casts_plot, data_df, color_choice)
+            if color_choice in casts_plot.columns and casts_plot.get_column(color_choice).drop_nulls().len() > 0:
+                color_column = color_choice
+            else:
+                st.info(f"No surface `{color_choice}` values matched these cast locations; coloring by cruise instead.")
+
+        hover_cols = [
+            c
+            for c in ["cruise_name", "number", "start_time", "depth", "sample_depth", color_choice]
+            if c in casts_plot.columns
+        ]
+        fig = px.scatter_map(
             casts_plot.to_pandas(),
             lat="latitude",
             lon="longitude",
-            color="cruise_name" if "cruise_name" in casts_plot.columns else None,
+            color=color_column if color_column in casts_plot.columns else None,
             hover_data=hover_cols,
+            color_continuous_scale="Viridis" if color_column == color_choice else None,
             zoom=6,
-            height=650,
+            height=700,
             map_style="open-street-map",
         )
-        fig.update_traces(mode="lines+markers")
-        fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
+        fig.update_traces(marker={"size": 11, "opacity": 0.9}, selector={"mode": "markers"})
+
+        for cruise_name, group in casts_plot.sort(["cruise_name", "start_time"]).to_pandas().groupby("cruise_name"):
+            fig.add_trace(
+                go.Scattermap(
+                    lat=group["latitude"],
+                    lon=group["longitude"],
+                    mode="lines",
+                    line={"color": "rgba(35, 35, 35, 0.35)", "width": 2},
+                    name=f"{cruise_name} track",
+                    hoverinfo="skip",
+                    showlegend=False,
+                )
+            )
+
+        bathy_lat, bathy_lon, bathy_depth = find_geospatial_columns(bathymetry_df)
+        if show_bathymetry and bathy_lat and bathy_lon and bathy_depth:
+            bathy_plot = bathymetry_df.drop_nulls([bathy_lat, bathy_lon, bathy_depth])
+            if bathy_plot.height > BATHYMETRY_POINT_LIMIT:
+                step = max(1, bathy_plot.height // BATHYMETRY_POINT_LIMIT)
+                bathy_plot = bathy_plot[::step]
+            bathy_pdf = bathy_plot.to_pandas()
+            fig.add_trace(
+                go.Scattermap(
+                    lat=bathy_pdf[bathy_lat],
+                    lon=bathy_pdf[bathy_lon],
+                    mode="markers",
+                    marker={
+                        "size": 4,
+                        "color": bathy_pdf[bathy_depth],
+                        "colorscale": "Blues",
+                        "opacity": 0.35,
+                        "showscale": False,
+                    },
+                    name="Bathymetry",
+                    text=bathy_pdf[bathy_depth],
+                    hovertemplate="Bathymetry: %{text}<br>Lat: %{lat}<br>Lon: %{lon}<extra></extra>",
+                )
+            )
+        elif show_bathymetry:
+            st.info("Bathymetry data are unavailable or do not include latitude, longitude, and depth columns.")
+
+        fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), legend={"orientation": "h"})
+        st.caption(
+            f"Station colors use `{dataset}` surface data from the shallowest sample at each cast when a variable is selected."
+        )
         st.plotly_chart(fig, width="stretch")
 
 
@@ -332,16 +456,21 @@ summary = cruise_df.filter(pl.col("name").is_in(selected))
 with st.skeleton(height=220):
     casts_df = load_casts(selected_tuple)
 
-needs_dataset = view in {"Sections", "Profiles", "Data"}
+needs_dataset = view in {"Cruise track", "Sections", "Profiles", "Data"}
 data_df = None
 if needs_dataset:
     with st.skeleton(height=220):
         data_df = load_dataset(selected_tuple, dataset)
 
+bathymetry_df = pl.DataFrame()
+if view == "Cruise track":
+    with st.skeleton(height=220):
+        bathymetry_df = load_bathymetry()
+
 render_metrics(summary, casts_df, data_df, dataset)
 
 if view == "Cruise track":
-    render_track(casts_df)
+    render_track(casts_df, bathymetry_df, data_df if data_df is not None else pl.DataFrame(), dataset)
 elif view == "Sections":
     render_section(data_df if data_df is not None else pl.DataFrame(), dataset, selected)
 elif view == "Profiles":

@@ -349,7 +349,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "pandas", specifier = ">=2.0" },
-    { name = "plotly", specifier = ">=5.22" },
+    { name = "plotly", specifier = ">=6.0" },
     { name = "polars", specifier = ">=1.0" },
     { name = "pyarrow", specifier = ">=15.0" },
     { name = "streamlit", specifier = ">=1.36" },
