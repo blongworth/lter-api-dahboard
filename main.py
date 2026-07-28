@@ -76,7 +76,9 @@ def normalize_dataframe(df: pl.DataFrame) -> pl.DataFrame:
     exprs = []
     for name, dtype in df.schema.items():
         if name in DATETIME_COLUMNS and dtype == pl.String:
-            exprs.append(pl.col(name).str.to_datetime(strict=False, time_zone="UTC").alias(name))
+            exprs.append(
+                pl.col(name).str.to_datetime(strict=False, time_zone="UTC").alias(name)
+            )
         elif name not in IDENTIFIER_COLUMNS and dtype == pl.String:
             exprs.append(pl.col(name).cast(pl.Float64, strict=False).alias(name))
     return df.with_columns(exprs) if exprs else df
@@ -84,7 +86,11 @@ def normalize_dataframe(df: pl.DataFrame) -> pl.DataFrame:
 
 def numeric_columns(df: pl.DataFrame, exclude: set[str] | None = None) -> list[str]:
     exclude = exclude or set()
-    return [name for name, dtype in df.schema.items() if name not in exclude and dtype.is_numeric()]
+    return [
+        name
+        for name, dtype in df.schema.items()
+        if name not in exclude and dtype.is_numeric()
+    ]
 
 
 @st.cache_data(ttl="1h", max_entries=5, show_spinner=False)
@@ -117,19 +123,35 @@ def join_bottle_summary_depth(cruise: str, bottles: pl.DataFrame) -> pl.DataFram
     try:
         summary = normalize_dataframe(fetch_csv(f"ctd/bottle_summary/{cruise}.csv"))
     except RuntimeError:
-        return bottles.with_columns(pl.col("depsm").alias("depth")) if "depsm" in bottles.columns else bottles
+        return (
+            bottles.with_columns(pl.col("depsm").alias("depth"))
+            if "depsm" in bottles.columns
+            else bottles
+        )
 
-    join_keys = [key for key in ["cruise", "cast", "niskin"] if key in bottles.columns and key in summary.columns]
+    join_keys = [
+        key
+        for key in ["cruise", "cast", "niskin"]
+        if key in bottles.columns and key in summary.columns
+    ]
     if len(join_keys) != 3 or "depth" not in summary.columns:
-        return bottles.with_columns(pl.col("depsm").alias("depth")) if "depsm" in bottles.columns else bottles
+        return (
+            bottles.with_columns(pl.col("depsm").alias("depth"))
+            if "depsm" in bottles.columns
+            else bottles
+        )
 
-    left = bottles.with_columns([pl.col("cast").cast(pl.Utf8), pl.col("niskin").cast(pl.Int64, strict=False)])
+    left = bottles.with_columns(
+        [pl.col("cast").cast(pl.Utf8), pl.col("niskin").cast(pl.Int64, strict=False)]
+    )
     right = summary.select(join_keys + ["depth"]).with_columns(
         [pl.col("cast").cast(pl.Utf8), pl.col("niskin").cast(pl.Int64, strict=False)]
     )
     joined = left.join(right, on=join_keys, how="left")
     if "depsm" in joined.columns:
-        joined = joined.with_columns(pl.coalesce([pl.col("depth"), pl.col("depsm")]).alias("depth"))
+        joined = joined.with_columns(
+            pl.coalesce([pl.col("depth"), pl.col("depsm")]).alias("depth")
+        )
     return joined
 
 
@@ -164,9 +186,13 @@ def surface_observations(data_df: pl.DataFrame, variable: str) -> pl.DataFrame:
     )
 
 
-def add_surface_variable(casts_df: pl.DataFrame, data_df: pl.DataFrame, variable: str) -> pl.DataFrame:
+def add_surface_variable(
+    casts_df: pl.DataFrame, data_df: pl.DataFrame, variable: str
+) -> pl.DataFrame:
     surface_df = surface_observations(data_df, variable)
-    if surface_df.is_empty() or not {"cruise_name", "number"}.issubset(casts_df.columns):
+    if surface_df.is_empty() or not {"cruise_name", "number"}.issubset(
+        casts_df.columns
+    ):
         return casts_df
 
     left = casts_df.with_columns(
@@ -175,23 +201,33 @@ def add_surface_variable(casts_df: pl.DataFrame, data_df: pl.DataFrame, variable
             pl.col("number").cast(pl.Utf8).alias("cast"),
         ]
     )
-    return left.join(surface_df, on=["cruise", "cast"], how="left").drop(["cruise", "cast"])
+    return left.join(surface_df, on=["cruise", "cast"], how="left").drop(
+        ["cruise", "cast"]
+    )
 
 
 def cruises_in_date_range(cruise_df: pl.DataFrame, start: date, end: date) -> list[str]:
     filtered = cruise_df.filter(
-        (pl.col("start_time").dt.date() <= end) & (pl.col("end_time").dt.date() >= start)
+        (pl.col("start_time").dt.date() <= end)
+        & (pl.col("end_time").dt.date() >= start)
     )
     return filtered.get_column("name").to_list()
 
 
-def dataframe_card(title: str, df: pl.DataFrame, *, key: str, height: int = 320) -> None:
+def dataframe_card(
+    title: str, df: pl.DataFrame, *, key: str, height: int = 320
+) -> None:
     with st.container(border=True):
         st.subheader(title)
         st.dataframe(df, hide_index=True, height=height, width="stretch", key=key)
 
 
-def render_metrics(summary: pl.DataFrame, casts_df: pl.DataFrame, data_df: pl.DataFrame | None, dataset: str) -> None:
+def render_metrics(
+    summary: pl.DataFrame,
+    casts_df: pl.DataFrame,
+    data_df: pl.DataFrame | None,
+    dataset: str,
+) -> None:
     n_cruises = summary.height
     n_casts = casts_df.height
     n_rows = data_df.height if data_df is not None else 0
@@ -211,11 +247,19 @@ def render_metrics(summary: pl.DataFrame, casts_df: pl.DataFrame, data_df: pl.Da
 def render_track(casts_df: pl.DataFrame, data_df: pl.DataFrame, dataset: str) -> None:
     with st.container(border=True):
         st.subheader("Cruise track, stations, and bathymetry")
-        if casts_df.is_empty() or not {"latitude", "longitude"}.issubset(casts_df.columns):
-            st.warning("No cast location data were available for the selected cruise(s).")
+        if casts_df.is_empty() or not {"latitude", "longitude"}.issubset(
+            casts_df.columns
+        ):
+            st.warning(
+                "No cast location data were available for the selected cruise(s)."
+            )
             return
 
-        surface_variables = numeric_columns(data_df, exclude=PLOT_EXCLUDE_COLUMNS) if not data_df.is_empty() else []
+        surface_variables = (
+            numeric_columns(data_df, exclude=PLOT_EXCLUDE_COLUMNS)
+            if not data_df.is_empty()
+            else []
+        )
         with st.container(horizontal=True, vertical_alignment="bottom"):
             color_choice = st.selectbox(
                 "Color stations by",
@@ -234,14 +278,26 @@ def render_track(casts_df: pl.DataFrame, data_df: pl.DataFrame, dataset: str) ->
         color_column = "cruise_name"
         if color_choice != "Cruise":
             casts_plot = add_surface_variable(casts_plot, data_df, color_choice)
-            if color_choice in casts_plot.columns and casts_plot.get_column(color_choice).drop_nulls().len() > 0:
+            if (
+                color_choice in casts_plot.columns
+                and casts_plot.get_column(color_choice).drop_nulls().len() > 0
+            ):
                 color_column = color_choice
             else:
-                st.info(f"No surface `{color_choice}` values matched these cast locations; coloring by cruise instead.")
+                st.info(
+                    f"No surface `{color_choice}` values matched these cast locations; coloring by cruise instead."
+                )
 
         hover_cols = [
             c
-            for c in ["cruise_name", "number", "start_time", "depth", "sample_depth", color_choice]
+            for c in [
+                "cruise_name",
+                "number",
+                "start_time",
+                "depth",
+                "sample_depth",
+                color_choice,
+            ]
             if c in casts_plot.columns
         ]
         fig = px.scatter_map(
@@ -255,9 +311,15 @@ def render_track(casts_df: pl.DataFrame, data_df: pl.DataFrame, dataset: str) ->
             height=700,
             map_style="white-bg" if show_bathymetry else "open-street-map",
         )
-        fig.update_traces(marker={"size": 11, "opacity": 0.9}, selector={"mode": "markers"})
+        fig.update_traces(
+            marker={"size": 11, "opacity": 0.9}, selector={"mode": "markers"}
+        )
 
-        for cruise_name, group in casts_plot.sort(["cruise_name", "start_time"]).to_pandas().groupby("cruise_name"):
+        for cruise_name, group in (
+            casts_plot.sort(["cruise_name", "start_time"])
+            .to_pandas()
+            .groupby("cruise_name")
+        ):
             fig.add_trace(
                 go.Scattermap(
                     lat=group["latitude"],
@@ -270,7 +332,10 @@ def render_track(casts_df: pl.DataFrame, data_df: pl.DataFrame, dataset: str) ->
                 )
             )
 
-        map_layout = {"margin": dict(l=0, r=0, t=0, b=0), "legend": {"orientation": "h"}}
+        map_layout = {
+            "margin": dict(l=0, r=0, t=0, b=0),
+            "legend": {"orientation": "h"},
+        }
         if show_bathymetry:
             map_layout["map"] = {
                 "layers": [
@@ -303,13 +368,21 @@ def render_section(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
             return
 
         with st.container(horizontal=True, vertical_alignment="bottom"):
-            x_options = [c for c in ["latitude", "longitude", "cast"] if c in data_df.columns]
+            x_options = [
+                c for c in ["latitude", "longitude", "cast"] if c in data_df.columns
+            ]
             x_axis = st.selectbox("Section x-axis", x_options, key="section_x_axis")
             variables = numeric_columns(data_df, exclude=PLOT_EXCLUDE_COLUMNS)
             variable = st.selectbox("Variable", variables, key="section_variable")
-            cruise_filter = st.multiselect("Cruises in section", selected, default=selected, key="section_cruises")
+            cruise_filter = st.multiselect(
+                "Cruises in section", selected, default=selected, key="section_cruises"
+            )
 
-        section_df = data_df.filter(pl.col("cruise").is_in(cruise_filter)) if "cruise" in data_df.columns else data_df
+        section_df = (
+            data_df.filter(pl.col("cruise").is_in(cruise_filter))
+            if "cruise" in data_df.columns
+            else data_df
+        )
         section_df = section_df.drop_nulls([x_axis, "depth", variable])
         if section_df.is_empty():
             st.info("No rows remain after applying the section filters.")
@@ -319,10 +392,30 @@ def render_section(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
             alt.Chart(section_df.to_pandas())
             .mark_circle(size=70, opacity=0.85)
             .encode(
-                x=alt.X(f"{x_axis}:Q" if x_axis != "cast" else f"{x_axis}:N", title=x_axis.replace("_", " ").title()),
+                x=alt.X(
+                    f"{x_axis}:Q" if x_axis != "cast" else f"{x_axis}:N",
+                    title=x_axis.replace("_", " ").title(),
+                ),
                 y=alt.Y("depth:Q", title="Depth (m)", sort="descending"),
-                color=alt.Color(f"{variable}:Q", title=variable.replace("_", " ").title(), scale=alt.Scale(scheme="viridis")),
-                tooltip=[c for c in ["cruise", "cast", "niskin", "date", "latitude", "longitude", "depth", variable] if c in section_df.columns],
+                color=alt.Color(
+                    f"{variable}:Q",
+                    title=variable.replace("_", " ").title(),
+                    scale=alt.Scale(scheme="viridis"),
+                ),
+                tooltip=[
+                    c
+                    for c in [
+                        "cruise",
+                        "cast",
+                        "niskin",
+                        "date",
+                        "latitude",
+                        "longitude",
+                        "depth",
+                        variable,
+                    ]
+                    if c in section_df.columns
+                ],
             )
             .interactive()
             .properties(height=620)
@@ -338,29 +431,65 @@ def render_profile(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
             st.warning("Load a dataset with depth values to view profiles.")
             return
 
-        profile_cruises = data_df.get_column("cruise").unique().sort().to_list() if "cruise" in data_df.columns else selected
+        profile_cruises = (
+            data_df.get_column("cruise").unique().sort().to_list()
+            if "cruise" in data_df.columns
+            else selected
+        )
         with st.container(horizontal=True, vertical_alignment="bottom"):
-            profile_cruise = st.selectbox("Cruise", profile_cruises, key="profile_cruise")
-            subset = data_df.filter(pl.col("cruise") == profile_cruise) if "cruise" in data_df.columns else data_df
-            casts = subset.get_column("cast").cast(pl.Utf8).unique().sort().to_list() if "cast" in subset.columns else []
+            profile_cruise = st.selectbox(
+                "Cruise", profile_cruises, key="profile_cruise"
+            )
+            subset = (
+                data_df.filter(pl.col("cruise") == profile_cruise)
+                if "cruise" in data_df.columns
+                else data_df
+            )
+            casts = (
+                subset.get_column("cast").cast(pl.Utf8).unique().sort().to_list()
+                if "cast" in subset.columns
+                else []
+            )
             profile_cast = st.selectbox("Cast/station", casts, key="profile_cast")
             variables = numeric_columns(subset, exclude=PLOT_EXCLUDE_COLUMNS)
-            profile_var = st.selectbox("Profile variable", variables, key="profile_variable")
+            profile_var = st.selectbox(
+                "Profile variable", variables, key="profile_variable"
+            )
 
-        profile_df = subset.filter(pl.col("cast").cast(pl.Utf8) == str(profile_cast)).drop_nulls(["depth", profile_var])
+        profile_df = subset.filter(
+            pl.col("cast").cast(pl.Utf8) == str(profile_cast)
+        ).drop_nulls(["depth", profile_var])
         if profile_df.is_empty():
             st.info("No profile rows remain after applying the filters.")
             return
 
-        color_column = "replicate" if "replicate" in profile_df.columns else alt.value("#1f77b4")
+        color_column = (
+            "replicate" if "replicate" in profile_df.columns else alt.value("#1f77b4")
+        )
         chart = (
             alt.Chart(profile_df.sort("depth").to_pandas())
             .mark_line(point=True)
             .encode(
-                x=alt.X(f"{profile_var}:Q", title=profile_var.replace("_", " ").title()),
+                x=alt.X(
+                    f"{profile_var}:Q", title=profile_var.replace("_", " ").title()
+                ),
                 y=alt.Y("depth:Q", title="Depth (m)", sort="descending"),
                 color=color_column,
-                tooltip=[c for c in ["cruise", "cast", "niskin", "replicate", "date", "latitude", "longitude", "depth", profile_var] if c in profile_df.columns],
+                tooltip=[
+                    c
+                    for c in [
+                        "cruise",
+                        "cast",
+                        "niskin",
+                        "replicate",
+                        "date",
+                        "latitude",
+                        "longitude",
+                        "depth",
+                        profile_var,
+                    ]
+                    if c in profile_df.columns
+                ],
             )
             .interactive()
             .properties(height=620)
@@ -373,11 +502,15 @@ def render_data(casts_df: pl.DataFrame, data_df: pl.DataFrame, dataset: str) -> 
         st.subheader("Loaded data")
         st.write(f"Casts: {casts_df.height:,} rows; {dataset}: {data_df.height:,} rows")
         st.caption(DEPTH_SOURCE_NOTES[dataset])
-        st.dataframe(data_df, hide_index=True, height=650, width="stretch", key="loaded_data")
+        st.dataframe(
+            data_df, hide_index=True, height=650, width="stretch", key="loaded_data"
+        )
 
 
 st.title("NES-LTER API dashboard")
-st.caption("Explore cruise tracks, depth sections, and single-station profiles from the NES-LTER API.")
+st.caption(
+    "Explore cruise tracks, depth sections, and single-station profiles from the NES-LTER API."
+)
 
 try:
     cruise_df = load_cruises()
@@ -387,18 +520,27 @@ except RuntimeError as exc:
 
 with st.sidebar:
     st.header("Filters")
-    selection_mode = st.segmented_control("Select by", ["Cruises", "Date range"], default="Cruises")
+    selection_mode = st.segmented_control(
+        "Select by", ["Cruises", "Date range"], default="Cruises"
+    )
 
     cruise_names = cruise_df.get_column("name").to_list()
     if selection_mode == "Cruises":
-        default = [name for name in ["EN608"] if name in cruise_names] or cruise_names[-1:]
-        selected = st.multiselect("Cruises", cruise_names, default=default, key="selected_cruises")
+        default = [name for name in ["EN608"] if name in cruise_names] or cruise_names[
+            -1:
+        ]
+        selected = st.multiselect(
+            "Cruises", cruise_names, default=default, key="selected_cruises"
+        )
     else:
         min_dt = cruise_df.get_column("start_time").drop_nulls().min()
         max_dt = cruise_df.get_column("end_time").drop_nulls().max()
         date_range = st.date_input(
             "Date range",
-            value=(min_dt.date() if min_dt else date(2017, 1, 1), max_dt.date() if max_dt else date.today()),
+            value=(
+                min_dt.date() if min_dt else date(2017, 1, 1),
+                max_dt.date() if max_dt else date.today(),
+            ),
             key="selected_date_range",
         )
         if len(date_range) != 2:
@@ -435,11 +577,17 @@ render_metrics(summary, casts_df, data_df, dataset)
 if view == "Cruise track":
     render_track(casts_df, data_df if data_df is not None else pl.DataFrame(), dataset)
 elif view == "Sections":
-    render_section(data_df if data_df is not None else pl.DataFrame(), dataset, selected)
+    render_section(
+        data_df if data_df is not None else pl.DataFrame(), dataset, selected
+    )
 elif view == "Profiles":
-    render_profile(data_df if data_df is not None else pl.DataFrame(), dataset, selected)
+    render_profile(
+        data_df if data_df is not None else pl.DataFrame(), dataset, selected
+    )
 elif view == "Data":
     render_data(casts_df, data_df if data_df is not None else pl.DataFrame(), dataset)
 
 with st.expander("Selected cruises"):
-    st.dataframe(summary, hide_index=True, width="stretch", key="selected_cruises_table")
+    st.dataframe(
+        summary, hide_index=True, width="stretch", key="selected_cruises_table"
+    )
