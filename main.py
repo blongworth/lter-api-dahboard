@@ -39,7 +39,8 @@ IDENTIFIER_COLUMNS = {
 }
 DATETIME_COLUMNS = {"start_time", "end_time", "date", "dateTime8601"}
 PLOT_EXCLUDE_COLUMNS = {"latitude", "longitude", "depth", "cast", "niskin"}
-BATHYMETRY_POINT_LIMIT = 8_000
+OCEAN_BASEMAP_TILE_URL = "https://services.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}"
+OCEAN_BASEMAP_ATTRIBUTION = "Esri, GEBCO, NOAA, National Geographic, Garmin, HERE, Geonames.org, and other contributors"
 
 st.set_page_config(page_title="NES-LTER API dashboard", layout="wide")
 
@@ -132,17 +133,6 @@ def join_bottle_summary_depth(cruise: str, bottles: pl.DataFrame) -> pl.DataFram
     return joined
 
 
-@st.cache_data(ttl="1h", max_entries=5, show_spinner=False)
-def load_bathymetry() -> pl.DataFrame:
-    try:
-        return normalize_dataframe(fetch_csv("ctd/bathymetry_file.csv"))
-    except RuntimeError:
-        # The API advertises this endpoint, but it can return 404 if the server-side
-        # bathymetry file is not mounted. Keep the dashboard usable and surface a
-        # notice in the map instead of failing the whole app.
-        return pl.DataFrame()
-
-
 @st.cache_data(ttl="1h", max_entries=30, show_spinner=False)
 def load_dataset(cruise_names: tuple[str, ...], dataset: str) -> pl.DataFrame:
     endpoint = DATASETS[dataset]
@@ -156,20 +146,6 @@ def load_dataset(cruise_names: tuple[str, ...], dataset: str) -> pl.DataFrame:
         except RuntimeError:
             continue
     return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
-
-
-def find_geospatial_columns(df: pl.DataFrame) -> tuple[str | None, str | None, str | None]:
-    lower_to_name = {name.lower(): name for name in df.columns}
-    latitude = next((lower_to_name[name] for name in ["latitude", "lat", "y"] if name in lower_to_name), None)
-    longitude = next((lower_to_name[name] for name in ["longitude", "lon", "long", "x"] if name in lower_to_name), None)
-    depth = next(
-        (lower_to_name[name] for name in ["depth", "bathymetry", "elevation", "z"] if name in lower_to_name),
-        None,
-    )
-    if depth is None:
-        numeric = [name for name in numeric_columns(df) if name not in {latitude, longitude}]
-        depth = numeric[0] if numeric else None
-    return latitude, longitude, depth
 
 
 def surface_observations(data_df: pl.DataFrame, variable: str) -> pl.DataFrame:
@@ -232,7 +208,7 @@ def render_metrics(summary: pl.DataFrame, casts_df: pl.DataFrame, data_df: pl.Da
         st.metric("Date span", date_label, border=True)
 
 
-def render_track(casts_df: pl.DataFrame, bathymetry_df: pl.DataFrame, data_df: pl.DataFrame, dataset: str) -> None:
+def render_track(casts_df: pl.DataFrame, data_df: pl.DataFrame, dataset: str) -> None:
     with st.container(border=True):
         st.subheader("Cruise track, stations, and bathymetry")
         if casts_df.is_empty() or not {"latitude", "longitude"}.issubset(casts_df.columns):
@@ -247,7 +223,12 @@ def render_track(casts_df: pl.DataFrame, bathymetry_df: pl.DataFrame, data_df: p
                 key="map_surface_variable",
                 help="Surface values use the shallowest available sample for each cast/station.",
             )
-            show_bathymetry = st.toggle("Show bathymetry", value=True, key="show_bathymetry")
+            show_bathymetry = st.toggle(
+                "Use ocean bathymetry basemap",
+                value=True,
+                key="show_bathymetry",
+                help="Uses Esri's public Ocean Basemap tiles, which include bathymetric relief.",
+            )
 
         casts_plot = casts_df.drop_nulls(["latitude", "longitude"])
         color_column = "cruise_name"
@@ -272,7 +253,7 @@ def render_track(casts_df: pl.DataFrame, bathymetry_df: pl.DataFrame, data_df: p
             color_continuous_scale="Viridis" if color_column == color_choice else None,
             zoom=6,
             height=700,
-            map_style="open-street-map",
+            map_style="white-bg" if show_bathymetry else "open-street-map",
         )
         fig.update_traces(marker={"size": 11, "opacity": 0.9}, selector={"mode": "markers"})
 
@@ -289,36 +270,23 @@ def render_track(casts_df: pl.DataFrame, bathymetry_df: pl.DataFrame, data_df: p
                 )
             )
 
-        bathy_lat, bathy_lon, bathy_depth = find_geospatial_columns(bathymetry_df)
-        if show_bathymetry and bathy_lat and bathy_lon and bathy_depth:
-            bathy_plot = bathymetry_df.drop_nulls([bathy_lat, bathy_lon, bathy_depth])
-            if bathy_plot.height > BATHYMETRY_POINT_LIMIT:
-                step = max(1, bathy_plot.height // BATHYMETRY_POINT_LIMIT)
-                bathy_plot = bathy_plot[::step]
-            bathy_pdf = bathy_plot.to_pandas()
-            fig.add_trace(
-                go.Scattermap(
-                    lat=bathy_pdf[bathy_lat],
-                    lon=bathy_pdf[bathy_lon],
-                    mode="markers",
-                    marker={
-                        "size": 4,
-                        "color": bathy_pdf[bathy_depth],
-                        "colorscale": "Blues",
-                        "opacity": 0.35,
-                        "showscale": False,
-                    },
-                    name="Bathymetry",
-                    text=bathy_pdf[bathy_depth],
-                    hovertemplate="Bathymetry: %{text}<br>Lat: %{lat}<br>Lon: %{lon}<extra></extra>",
-                )
-            )
-        elif show_bathymetry:
-            st.info("Bathymetry data are unavailable or do not include latitude, longitude, and depth columns.")
-
-        fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), legend={"orientation": "h"})
+        map_layout = {"margin": dict(l=0, r=0, t=0, b=0), "legend": {"orientation": "h"}}
+        if show_bathymetry:
+            map_layout["map"] = {
+                "layers": [
+                    {
+                        "sourcetype": "raster",
+                        "source": [OCEAN_BASEMAP_TILE_URL],
+                        "sourceattribution": OCEAN_BASEMAP_ATTRIBUTION,
+                        "type": "raster",
+                        "below": "traces",
+                    }
+                ]
+            }
+        fig.update_layout(**map_layout)
         st.caption(
-            f"Station colors use `{dataset}` surface data from the shallowest sample at each cast when a variable is selected."
+            f"Station colors use `{dataset}` surface data from the shallowest sample at each cast when a variable is selected. "
+            f"Bathymetry is shown with public Esri Ocean Basemap tiles when enabled."
         )
         st.plotly_chart(fig, width="stretch")
 
@@ -462,15 +430,10 @@ if needs_dataset:
     with st.skeleton(height=220):
         data_df = load_dataset(selected_tuple, dataset)
 
-bathymetry_df = pl.DataFrame()
-if view == "Cruise track":
-    with st.skeleton(height=220):
-        bathymetry_df = load_bathymetry()
-
 render_metrics(summary, casts_df, data_df, dataset)
 
 if view == "Cruise track":
-    render_track(casts_df, bathymetry_df, data_df if data_df is not None else pl.DataFrame(), dataset)
+    render_track(casts_df, data_df if data_df is not None else pl.DataFrame(), dataset)
 elif view == "Sections":
     render_section(data_df if data_df is not None else pl.DataFrame(), dataset, selected)
 elif view == "Profiles":
