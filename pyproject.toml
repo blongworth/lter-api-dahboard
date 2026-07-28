@@ -1,0 +1,14 @@
+[project]
+name = "lter-api-dahboard"
+version = "0.1.0"
+description = "A Streamlit dashboard for the NES-LTER API"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "streamlit>=1.36",
+    "polars>=1.0",
+    "plotly>=5.22",
+    "pandas>=2.0",
+    "pyarrow>=15.0",
+    "watchdog>=6.0.0",
+]
