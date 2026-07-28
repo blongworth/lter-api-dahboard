@@ -1,5 +1,5 @@
 [project]
-name = "lter-api-dahboard"
+name = "lter-api-dashboard"
 version = "0.1.0"
 description = "A Streamlit dashboard for the NES-LTER API"
 readme = "README.md"

@@ -28,7 +28,7 @@ uv run streamlit run main.py
 
 Use these settings at <https://share.streamlit.io/>:
 
-- Repository: `blongworth/lter-api-dahboard`
+- Repository: `blongworth/lter-api-dashboard`
 - Branch: `main`
 - Main file path: `main.py`
 
