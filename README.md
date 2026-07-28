@@ -10,10 +10,10 @@ A simple Streamlit + Polars dashboard for data from <https://nes-lter-api.whoi.e
 - Single-cast/station profile plots.
 - Supports CTD bottle, nutrient, and chlorophyll endpoints.
 
-## Run
+## Run locally
 
 ```bash
-pip install -e .
+pip install -r requirements.txt
 streamlit run main.py
 ```
 
@@ -23,3 +23,13 @@ If using `uv`:
 uv sync
 uv run streamlit run main.py
 ```
+
+## Deploy on Streamlit Community Cloud
+
+Use these settings at <https://share.streamlit.io/>:
+
+- Repository: `blongworth/lter-api-dahboard`
+- Branch: `main`
+- Main file path: `main.py`
+
+No secrets are required.
