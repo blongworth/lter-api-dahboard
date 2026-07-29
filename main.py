@@ -559,6 +559,129 @@ def section_bathymetry(
     )
 
 
+@st.cache_data(ttl="1h", max_entries=30, show_spinner=False)
+def interpolate_section(
+    section_df: pl.DataFrame, x_axis: str, variable: str
+) -> pl.DataFrame:
+    """Locally grid section observations using an ODV-like weighted average."""
+    if x_axis not in {"latitude", "longitude"}:
+        return pl.DataFrame()
+
+    try:
+        import numpy as np
+        from scipy.spatial import cKDTree
+
+        profile_keys = [key for key in ["cruise", "cast"] if key in section_df.columns]
+        if not profile_keys:
+            return pl.DataFrame()
+        columns = profile_keys + [x_axis, "depth", variable]
+        sample = section_df.select(columns).drop_nulls().to_pandas()
+        if sample.empty:
+            return pl.DataFrame()
+
+        profiles = []
+        for _, profile in sample.groupby(profile_keys, dropna=True):
+            x_value = float(profile[x_axis].median())
+            profile = (
+                profile.groupby("depth", as_index=False)[variable]
+                .mean()
+                .sort_values("depth")
+            )
+            if len(profile) < 2:
+                continue
+            profiles.append((x_value, profile["depth"].to_numpy(), profile[variable].to_numpy()))
+        if len(profiles) < 2:
+            return pl.DataFrame()
+
+        profile_x = np.array([profile[0] for profile in profiles])
+        depth_min = min(profile[1].min() for profile in profiles)
+        depth_max = max(profile[1].max() for profile in profiles)
+        x_min, x_max = profile_x.min(), profile_x.max()
+        if x_min == x_max or depth_min == depth_max:
+            return pl.DataFrame()
+
+        x_grid = np.linspace(x_min, x_max, 120)
+        depth_grid = np.linspace(depth_min, depth_max, 100)
+        profile_values = np.full((len(profiles), len(depth_grid)), np.nan)
+        for row, (_, depths, values) in enumerate(profiles):
+            # No vertical extrapolation: values exist only between observations
+            # within the same cast.
+            valid_depths = (depth_grid >= depths.min()) & (depth_grid <= depths.max())
+            profile_values[row, valid_depths] = np.interp(
+                depth_grid[valid_depths], depths, values
+            )
+
+        # At each depth, use nearby cast profiles only. This avoids diagonal
+        # blending between unrelated shallow and deep observations.
+        radius = max((x_max - x_min) * 0.18, 1e-9)
+        tree = cKDTree(profile_x[:, None])
+        neighbors = min(8, len(profiles))
+        distances, indices = tree.query(
+            x_grid[:, None], k=neighbors, distance_upper_bound=radius, workers=-1
+        )
+        if neighbors == 1:
+            distances = distances[:, None]
+            indices = indices[:, None]
+        valid_neighbors = indices < len(profiles)
+        safe_indices = np.minimum(indices, len(profiles) - 1)
+        grid_values = np.full((len(depth_grid), len(x_grid)), np.nan)
+        for depth_row in range(len(depth_grid)):
+            available = valid_neighbors & np.isfinite(profile_values[:, depth_row])[safe_indices]
+            weights = np.where(
+                available, 1.0 / np.maximum(distances, 1e-9) ** 2, 0.0
+            )
+            values = np.where(
+                available, profile_values[safe_indices, depth_row], 0.0
+            )
+            weight_sum = weights.sum(axis=1)
+            grid_values[depth_row] = np.divide(
+                (values * weights).sum(axis=1),
+                weight_sum,
+                out=np.full(len(x_grid), np.nan),
+                where=weight_sum > 0,
+            )
+
+        grid_x, grid_depth = np.meshgrid(x_grid, depth_grid)
+        valid = np.isfinite(grid_values)
+        return pl.DataFrame(
+            {
+                x_axis: grid_x[valid],
+                "depth": grid_depth[valid],
+                variable: grid_values[valid],
+            }
+        )
+    except Exception:
+        return pl.DataFrame()
+
+
+def mask_interpolation_by_bathymetry(
+    interpolated_df: pl.DataFrame,
+    bathymetry_df: pl.DataFrame,
+    x_axis: str,
+) -> pl.DataFrame:
+    """Remove interpolated cells at or below the GEBCO seafloor."""
+    if interpolated_df.is_empty() or bathymetry_df.is_empty():
+        return pl.DataFrame()
+
+    import numpy as np
+
+    bathymetry = bathymetry_df.sort(x_axis)
+    bathy_x = bathymetry.get_column(x_axis).to_numpy()
+    bathy_depth = bathymetry.get_column("bathymetry").to_numpy()
+    grid_x = interpolated_df.get_column(x_axis).to_numpy()
+    bottom = np.interp(
+        grid_x,
+        bathy_x,
+        bathy_depth,
+        left=np.nan,
+        right=np.nan,
+    )
+    valid = np.isfinite(bottom) & (
+        interpolated_df.get_column("depth").to_numpy() < bottom
+    )
+    return interpolated_df.filter(pl.Series("valid", valid))
+
+
 def dataframe_card(
     title: str, df: pl.DataFrame, *, key: str, height: int = 320
 ) -> None:
@@ -804,6 +927,12 @@ def render_section(
             cruise_filter = st.multiselect(
                 "Cruises in section", selected, default=selected, key="section_cruises"
             )
+            interpolate = st.toggle(
+                "Interpolate between points",
+                value=False,
+                key="section_interpolate",
+                help="Estimate values between observations, masked to the GEBCO seafloor.",
+            )
             show_bathymetry = st.toggle(
                 "Show filled bathymetry",
                 value=True,
@@ -821,6 +950,28 @@ def render_section(
             st.info("No rows remain after applying the section filters.")
             return
 
+        section_bathy_df = pl.DataFrame()
+        if show_bathymetry or interpolate:
+            other_axis = "longitude" if x_axis == "latitude" else "latitude"
+            if x_axis in {"latitude", "longitude"} and other_axis in section_df.columns:
+                bathymetry_extent = section_df.select([x_axis, other_axis]).drop_nulls()
+                if not bathymetry_extent.is_empty():
+                    section_bathy_df = section_bathymetry(
+                        x_axis,
+                        float(bathymetry_extent.get_column(x_axis).min()),
+                        float(bathymetry_extent.get_column(x_axis).max()),
+                        float(bathymetry_extent.get_column(other_axis).median()),
+                    )
+
+        section_plot_bottom = float(section_df.get_column("depth").max())
+        if not section_bathy_df.is_empty():
+            section_plot_bottom = max(
+                section_plot_bottom,
+                float(section_bathy_df.get_column("bathymetry").max()),
+            )
+        section_plot_bottom = max(section_plot_bottom * 1.02, 1.0)
+        y_scale = alt.Scale(domain=[0, section_plot_bottom])
+
         points = (
             alt.Chart(section_df.to_pandas())
             .mark_circle(size=70, opacity=0.85)
@@ -834,7 +985,12 @@ def render_section(
                         else alt.Undefined
                     ),
                 ),
-                y=alt.Y("depth:Q", title="Depth (m)", sort="descending"),
+                y=alt.Y(
+                    "depth:Q",
+                    title="Depth (m)",
+                    sort="descending",
+                    scale=y_scale,
+                ),
                 color=alt.Color(
                     f"{variable}:Q",
                     title=variable.replace("_", " ").title(),
@@ -856,22 +1012,50 @@ def render_section(
                 ],
             )
         )
-        layers = [points]
-        if show_bathymetry:
-            other_axis = "longitude" if x_axis == "latitude" else "latitude"
-            section_bathy_df = pl.DataFrame()
-            if x_axis in {"latitude", "longitude"} and other_axis in section_df.columns:
-                bathymetry_extent = section_df.select([x_axis, other_axis]).drop_nulls()
-                if not bathymetry_extent.is_empty():
-                    section_bathy_df = section_bathymetry(
-                        x_axis,
-                        float(bathymetry_extent.get_column(x_axis).min()),
-                        float(bathymetry_extent.get_column(x_axis).max()),
-                        float(bathymetry_extent.get_column(other_axis).median()),
+        layers = []
+        if interpolate:
+            if section_bathy_df.is_empty():
+                st.info("Interpolation requires bathymetry data and was not shown.")
+            else:
+                interpolated_df = mask_interpolation_by_bathymetry(
+                    interpolate_section(section_df, x_axis, variable),
+                    section_bathy_df,
+                    x_axis,
+                )
+                if not interpolated_df.is_empty():
+                    layers.append(
+                        alt.Chart(interpolated_df.to_pandas())
+                        .mark_rect()
+                        .encode(
+                            x=alt.X(
+                                f"{x_axis}:Q",
+                                title=x_axis.replace("_", " ").title(),
+                            ),
+                            y=alt.Y(
+                                "depth:Q",
+                                title="Depth (m)",
+                                sort="descending",
+                                scale=y_scale,
+                            ),
+                            color=alt.Color(
+                                f"{variable}:Q",
+                                title=variable.replace("_", " ").title(),
+                                scale=alt.Scale(scheme="viridis"),
+                            ),
+                        )
                     )
+                else:
+                    st.info("No interpolated cells remained above the bathymetry.")
+
+        layers.append(points)
+        if show_bathymetry:
             if not section_bathy_df.is_empty():
                 bathymetry = (
-                    alt.Chart(section_bathy_df.to_pandas())
+                    alt.Chart(
+                        section_bathy_df.with_columns(
+                            pl.lit(section_plot_bottom).alias("section_bottom")
+                        ).to_pandas()
+                    )
                     .mark_area(color="#6b7280", opacity=0.35)
                     .encode(
                         x=alt.X(
@@ -879,8 +1063,13 @@ def render_section(
                             title=x_axis.replace("_", " ").title(),
                             scale=alt.Scale(zero=False),
                         ),
-                        y=alt.Y("surface:Q", title="Depth (m)", sort="descending"),
-                        y2="bathymetry:Q",
+                        y=alt.Y(
+                            "bathymetry:Q",
+                            title="Depth (m)",
+                            sort="descending",
+                            scale=y_scale,
+                        ),
+                        y2="section_bottom:Q",
                         tooltip=[
                             alt.Tooltip(f"{x_axis}:Q", title=x_axis.title()),
                             alt.Tooltip("bathymetry:Q", title="Bathymetry (m)"),
