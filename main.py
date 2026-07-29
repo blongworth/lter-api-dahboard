@@ -154,7 +154,13 @@ def add_temperature_property(df: pl.DataFrame, *, bottle: bool = False) -> pl.Da
         ["temperature", "t090c", "potemp090c", "temp"]
         if bottle
         else [
-            "temperature",
+            "tsg_sst",
+            "tsg1_sst",
+            "tsg2_sst",
+            "tst_temperature",
+            "tsg_temperature",
+            "tsg1_temperature",
+            "tsg2_temperature",
             "sbe48t",
             "aml_sst",
             "water_temperature_degree_c",
@@ -163,11 +169,13 @@ def add_temperature_property(df: pl.DataFrame, *, bottle: bool = False) -> pl.Da
     available = [candidate for candidate in candidates if candidate in df.columns]
     if not available:
         return df
-    return df.with_columns(
-        pl.coalesce(
-            [pl.col(column).cast(pl.Float64, strict=False) for column in available]
-        ).alias("temperature")
+    value = pl.coalesce(
+        [pl.col(column).cast(pl.Float64, strict=False) for column in available]
     )
+    expressions = [value.alias("temperature")]
+    if not bottle:
+        expressions.append(value.alias("sst"))
+    return df.with_columns(expressions)
 
 
 def property_options(
@@ -181,6 +189,13 @@ def temperature_property_index(options: list[str]) -> int:
     """Select the first common temperature field, falling back to the first option."""
     temperature_fields = [
         "temperature",
+        "tsg_sst",
+        "tsg1_sst",
+        "tsg2_sst",
+        "tst_temperature",
+        "tsg_temperature",
+        "tsg1_temperature",
+        "tsg2_temperature",
         "sbe48t",
         "aml_sst",
         "water_temperature_degree_c",
@@ -193,6 +208,10 @@ def temperature_property_index(options: list[str]) -> int:
         if field in options:
             return options.index(field)
     return 0
+
+
+def sst_property_index(options: list[str]) -> int:
+    return options.index("sst") if "sst" in options else temperature_property_index(options)
 
 
 @st.cache_data(ttl="1h", max_entries=5, show_spinner=False)
@@ -536,7 +555,7 @@ def render_track(
             color_choice = st.selectbox(
                 "Underway property",
                 underway_options,
-                index=temperature_property_index(underway_options),
+                index=sst_property_index(underway_options),
                 key="map_surface_variable",
                 help="Choose the property used to color underway observations.",
             )
@@ -883,14 +902,39 @@ def render_profile(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
         st.altair_chart(chart, width="stretch")
 
 
-def render_data(casts_df: pl.DataFrame, data_df: pl.DataFrame, dataset: str) -> None:
+def render_data(
+    casts_df: pl.DataFrame,
+    data_df: pl.DataFrame,
+    bottle_df: pl.DataFrame,
+    underway_df: pl.DataFrame,
+    dataset: str,
+) -> None:
     with st.container(border=True):
         st.subheader("Loaded data")
-        st.write(f"Casts: {casts_df.height:,} rows; {dataset}: {data_df.height:,} rows")
-        st.caption(DEPTH_SOURCE_NOTES[dataset])
-        st.dataframe(
-            data_df, hide_index=True, height=650, width="stretch", key="loaded_data"
-        )
+        datasets = [
+            ("Underway", underway_df, None),
+            ("CTD casts", casts_df, None),
+            ("CTD bottles", bottle_df, DEPTH_SOURCE_NOTES["CTD bottles"]),
+        ]
+        if dataset != "CTD bottles":
+            datasets.append((dataset, data_df, DEPTH_SOURCE_NOTES[dataset]))
+
+        tabs = st.tabs([name for name, _, _ in datasets])
+        for tab, (name, table, note) in zip(tabs, datasets):
+            with tab:
+                st.write(f"{name}: {table.height:,} rows")
+                if note:
+                    st.caption(note)
+                if table.is_empty():
+                    st.info(f"No {name.lower()} data were available for the selected cruise(s).")
+                else:
+                    st.dataframe(
+                        table,
+                        hide_index=True,
+                        height=650,
+                        width="stretch",
+                        key=f"loaded_data_{name.lower().replace(' ', '_')}"
+                    )
 
 
 st.title("NES-LTER API dashboard")
@@ -985,7 +1029,13 @@ elif view == "Profiles":
         data_df if data_df is not None else pl.DataFrame(), dataset, selected
     )
 elif view == "Data":
-    render_data(casts_df, data_df if data_df is not None else pl.DataFrame(), dataset)
+    render_data(
+        casts_df,
+        data_df if data_df is not None else pl.DataFrame(),
+        bottle_df if bottle_df is not None else pl.DataFrame(),
+        underway_df if underway_df is not None else pl.DataFrame(),
+        dataset,
+    )
 
 with st.expander("Selected cruises"):
     st.dataframe(
