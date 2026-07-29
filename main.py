@@ -19,6 +19,10 @@ DATASETS = {
     "Chlorophyll": "chl/{cruise}.csv",
 }
 UNDERWAY_ENDPOINT = "underway/{cruise}.csv"
+GEBCO_OPENDAP_URL = (
+    "https://dap.ceda.ac.uk/thredds/dodsC/bodc/gebco/global/gebco_2026/"
+    "ice_surface_elevation/netcdf/GEBCO_2026.nc"
+)
 DEPTH_SOURCE_NOTES = {
     "CTD bottles": "Depth is added from the API's CTD bottle summary metadata (`ctd/bottle_summary/{cruise}.csv`).",
     "Nutrients": "Depth is provided directly by the nutrients endpoint.",
@@ -498,6 +502,63 @@ def cruises_in_date_range(cruise_df: pl.DataFrame, start: date, end: date) -> li
     return filtered.get_column("name").to_list()
 
 
+@st.cache_data(ttl="24h", max_entries=20, show_spinner=False)
+def section_bathymetry(
+    x_axis: str, x_min: float, x_max: float, other_center: float
+) -> pl.DataFrame:
+    """Fetch a narrow GEBCO OPeNDAP profile for a section."""
+    if x_axis not in {"latitude", "longitude"}:
+        return pl.DataFrame()
+
+    try:
+        import xarray as xr
+
+        half_width = 0.25
+        latitude_slice = (
+            slice(x_min, x_max)
+            if x_axis == "latitude"
+            else slice(other_center - half_width, other_center + half_width)
+        )
+        longitude_slice = (
+            slice(other_center - half_width, other_center + half_width)
+            if x_axis == "latitude"
+            else slice(x_min, x_max)
+        )
+        with xr.open_dataset(
+            GEBCO_OPENDAP_URL, engine="pydap", decode_cf=False
+        ) as dataset:
+            elevation = dataset["elevation"].sel(
+                lat=latitude_slice,
+                lon=longitude_slice,
+            )
+            if x_axis == "latitude":
+                elevation = elevation.median(dim="lon", skipna=True)
+                values = elevation.to_dataframe(name="elevation").reset_index()
+                values = values.rename(columns={"lat": "section_x"})
+            else:
+                elevation = elevation.median(dim="lat", skipna=True)
+                values = elevation.to_dataframe(name="elevation").reset_index()
+                values = values.rename(columns={"lon": "section_x"})
+    except Exception:
+        return pl.DataFrame()
+
+    bathymetry = pl.from_pandas(values).select(
+        [
+            pl.col("section_x").cast(pl.Float64, strict=False).alias(x_axis),
+            (-pl.col("elevation")).cast(pl.Float64, strict=False).alias("bathymetry"),
+        ]
+    )
+    return (
+        bathymetry.select([x_axis, "bathymetry"])
+        .drop_nulls()
+        .filter(pl.col("bathymetry") > 0)
+        .group_by(x_axis)
+        .agg(pl.col("bathymetry").median())
+        .sort(x_axis)
+        .with_columns(pl.lit(0.0).alias("surface"))
+    )
+
+
 def dataframe_card(
     title: str, df: pl.DataFrame, *, key: str, height: int = 320
 ) -> None:
@@ -718,7 +779,11 @@ def render_track(
         st.plotly_chart(fig, width="stretch")
 
 
-def render_section(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> None:
+def render_section(
+    data_df: pl.DataFrame,
+    dataset: str,
+    selected: list[str],
+) -> None:
     with st.container(border=True):
         st.subheader(f"Sections from {dataset}")
         st.caption(DEPTH_SOURCE_NOTES[dataset])
@@ -739,6 +804,12 @@ def render_section(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
             cruise_filter = st.multiselect(
                 "Cruises in section", selected, default=selected, key="section_cruises"
             )
+            show_bathymetry = st.toggle(
+                "Show filled bathymetry",
+                value=True,
+                key="section_bathymetry",
+                help="Fill the seafloor below the section using underway bathymetry data.",
+            )
 
         section_df = (
             data_df.filter(pl.col("cruise").is_in(cruise_filter))
@@ -750,7 +821,7 @@ def render_section(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
             st.info("No rows remain after applying the section filters.")
             return
 
-        chart = (
+        points = (
             alt.Chart(section_df.to_pandas())
             .mark_circle(size=70, opacity=0.85)
             .encode(
@@ -784,9 +855,43 @@ def render_section(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
                     if c in section_df.columns
                 ],
             )
-            .interactive()
-            .properties(height=620)
         )
+        layers = [points]
+        if show_bathymetry:
+            other_axis = "longitude" if x_axis == "latitude" else "latitude"
+            section_bathy_df = pl.DataFrame()
+            if x_axis in {"latitude", "longitude"} and other_axis in section_df.columns:
+                bathymetry_extent = section_df.select([x_axis, other_axis]).drop_nulls()
+                if not bathymetry_extent.is_empty():
+                    section_bathy_df = section_bathymetry(
+                        x_axis,
+                        float(bathymetry_extent.get_column(x_axis).min()),
+                        float(bathymetry_extent.get_column(x_axis).max()),
+                        float(bathymetry_extent.get_column(other_axis).median()),
+                    )
+            if not section_bathy_df.is_empty():
+                bathymetry = (
+                    alt.Chart(section_bathy_df.to_pandas())
+                    .mark_area(color="#6b7280", opacity=0.35)
+                    .encode(
+                        x=alt.X(
+                            f"{x_axis}:Q",
+                            title=x_axis.replace("_", " ").title(),
+                            scale=alt.Scale(zero=False),
+                        ),
+                        y=alt.Y("surface:Q", title="Depth (m)", sort="descending"),
+                        y2="bathymetry:Q",
+                        tooltip=[
+                            alt.Tooltip(f"{x_axis}:Q", title=x_axis.title()),
+                            alt.Tooltip("bathymetry:Q", title="Bathymetry (m)"),
+                        ],
+                    )
+                )
+                layers.insert(0, bathymetry)
+            else:
+                st.info("No raster bathymetry data were available for this section.")
+
+        chart = alt.layer(*layers).interactive().properties(height=620)
         st.altair_chart(chart, width="stretch")
 
 
@@ -1022,7 +1127,9 @@ if view == "Cruise track":
     )
 elif view == "Sections":
     render_section(
-        data_df if data_df is not None else pl.DataFrame(), dataset, selected
+        data_df if data_df is not None else pl.DataFrame(),
+        dataset,
+        selected,
     )
 elif view == "Profiles":
     render_profile(
