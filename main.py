@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import io
-from datetime import date
+from datetime import date, datetime
+from math import asin, cos, radians, sin, sqrt
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -17,6 +18,7 @@ DATASETS = {
     "Nutrients": "nut/{cruise}.csv",
     "Chlorophyll": "chl/{cruise}.csv",
 }
+UNDERWAY_ENDPOINT = "underway/{cruise}.csv"
 DEPTH_SOURCE_NOTES = {
     "CTD bottles": "Depth is added from the API's CTD bottle summary metadata (`ctd/bottle_summary/{cruise}.csv`).",
     "Nutrients": "Depth is provided directly by the nutrients endpoint.",
@@ -36,9 +38,25 @@ IDENTIFIER_COLUMNS = {
     "alternate_sample_id",
     "project_id",
     "nearest_station",
+    "station",
+    "stationfullname",
+    "comment",
 }
 DATETIME_COLUMNS = {"start_time", "end_time", "date", "dateTime8601"}
-PLOT_EXCLUDE_COLUMNS = {"latitude", "longitude", "depth", "cast", "niskin"}
+PLOT_EXCLUDE_COLUMNS = {
+    "latitude",
+    "longitude",
+    "dec_lat",
+    "dec_lon",
+    "latitude_deg",
+    "longitude_deg",
+    "gps_furuno_latitude",
+    "gps_furuno_longitude",
+    "depth",
+    "cast",
+    "niskin",
+    "nearest_station_distance_km",
+}
 OCEAN_BASEMAP_TILE_URL = "https://services.arcgisonline.com/ArcGIS/rest/services/Ocean/World_Ocean_Base/MapServer/tile/{z}/{y}/{x}"
 OCEAN_BASEMAP_ATTRIBUTION = "Esri, GEBCO, NOAA, National Geographic, Garmin, HERE, Geonames.org, and other contributors"
 
@@ -93,6 +111,90 @@ def numeric_columns(df: pl.DataFrame, exclude: set[str] | None = None) -> list[s
     ]
 
 
+def normalize_underway_coordinates(df: pl.DataFrame) -> pl.DataFrame:
+    """Normalize vessel-specific underway navigation columns for the map."""
+    latitude_aliases = [
+        "latitude",
+        "dec_lat",
+        "latitude_deg",
+        "gps_furuno_latitude",
+        "gps_garmin741_latitude",
+        "gps_nstarwaas_latitude",
+        "gnss_adu2_latitude",
+        "gnss_adu5_latitude",
+    ]
+    longitude_aliases = [
+        "longitude",
+        "dec_lon",
+        "longitude_deg",
+        "gps_furuno_longitude",
+        "gps_garmin741_longitude",
+        "gps_nstarwaas_longitude",
+        "gnss_adu2_longitude",
+        "gnss_adu5_longitude",
+    ]
+    expressions = []
+    for canonical, aliases in [
+        ("latitude", latitude_aliases),
+        ("longitude", longitude_aliases),
+    ]:
+        available = [alias for alias in aliases if alias in df.columns]
+        if available:
+            expressions.append(
+                pl.coalesce(
+                    [pl.col(alias).cast(pl.Float64, strict=False) for alias in available]
+                ).alias(canonical)
+            )
+    return df.with_columns(expressions) if expressions else df
+
+
+def add_temperature_property(df: pl.DataFrame, *, bottle: bool = False) -> pl.DataFrame:
+    """Expose a consistent temperature property across vessel/data schemas."""
+    candidates = (
+        ["temperature", "t090c", "potemp090c", "temp"]
+        if bottle
+        else [
+            "temperature",
+            "sbe48t",
+            "aml_sst",
+            "water_temperature_degree_c",
+        ]
+    )
+    available = [candidate for candidate in candidates if candidate in df.columns]
+    if not available:
+        return df
+    return df.with_columns(
+        pl.coalesce(
+            [pl.col(column).cast(pl.Float64, strict=False) for column in available]
+        ).alias("temperature")
+    )
+
+
+def property_options(
+    df: pl.DataFrame, *, include_cruise: bool = False
+) -> list[str]:
+    options = numeric_columns(df, exclude=PLOT_EXCLUDE_COLUMNS) if not df.is_empty() else []
+    return (["Cruise"] if include_cruise else []) + options
+
+
+def temperature_property_index(options: list[str]) -> int:
+    """Select the first common temperature field, falling back to the first option."""
+    temperature_fields = [
+        "temperature",
+        "sbe48t",
+        "aml_sst",
+        "water_temperature_degree_c",
+        "t090c",
+        "potemp090c",
+        "temperature",
+        "temp",
+    ]
+    for field in temperature_fields:
+        if field in options:
+            return options.index(field)
+    return 0
+
+
 @st.cache_data(ttl="1h", max_entries=5, show_spinner=False)
 def load_cruises() -> pl.DataFrame:
     return normalize_dataframe(fetch_csv("ctd/cruises/all.csv")).sort("start_time")
@@ -104,6 +206,24 @@ def load_casts(cruise_names: tuple[str, ...]) -> pl.DataFrame:
     for cruise in cruise_names:
         try:
             frames.append(normalize_dataframe(fetch_csv(f"ctd/casts/{cruise}.csv")))
+        except RuntimeError:
+            continue
+    return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+
+
+@st.cache_data(ttl="1h", max_entries=30, show_spinner=False)
+def load_underway(cruise_names: tuple[str, ...]) -> pl.DataFrame:
+    """Load underway navigation and surface observations for each cruise."""
+    frames = []
+    for cruise in cruise_names:
+        try:
+            df = normalize_underway_coordinates(
+                normalize_dataframe(fetch_csv(UNDERWAY_ENDPOINT.format(cruise=cruise)))
+            )
+            df = add_temperature_property(df)
+            if "cruise" not in df.columns:
+                df = df.with_columns(pl.lit(cruise).alias("cruise"))
+            frames.append(df)
         except RuntimeError:
             continue
     return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
@@ -155,6 +275,116 @@ def join_bottle_summary_depth(cruise: str, bottles: pl.DataFrame) -> pl.DataFram
     return joined
 
 
+@st.cache_data(ttl="24h", max_entries=1, show_spinner=False)
+def load_stations() -> pl.DataFrame:
+    """Load the NES-LTER station reference file from the API."""
+    return fetch_csv("stations/file.csv").with_columns(
+        [
+            pl.col("startDate").str.to_date(strict=False).alias("start_date"),
+            pl.when(pl.col("endDate") == "current")
+            .then(None)
+            .otherwise(pl.col("endDate"))
+            .str.to_date(strict=False)
+            .alias("end_date"),
+            pl.col("decimalLatitude").alias("station_latitude"),
+            pl.col("decimalLongitude").alias("station_longitude"),
+        ]
+    )
+
+
+def observation_date(value: object) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).date()
+        except ValueError:
+            return None
+    return None
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    radius_km = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = (
+        sin(dlat / 2) ** 2
+        + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    )
+    return 2 * radius_km * asin(sqrt(a))
+
+
+def add_nearest_station(data_df: pl.DataFrame) -> pl.DataFrame:
+    """Add nearest station labels from the API station reference endpoint."""
+    if data_df.is_empty() or "nearest_station" in data_df.columns:
+        return data_df
+    if not {"latitude", "longitude"}.issubset(data_df.columns):
+        return data_df
+
+    stations_df = load_stations().drop_nulls(
+        ["station", "station_latitude", "station_longitude"]
+    )
+    if stations_df.is_empty():
+        return data_df
+
+    station_records = stations_df.select(
+        ["station", "station_latitude", "station_longitude", "start_date", "end_date"]
+    ).to_dicts()
+    nearest_stations: list[str | None] = []
+    nearest_distances: list[float | None] = []
+    cache: dict[tuple[float, float, date | None], tuple[str | None, float | None]] = {}
+    date_column = "date" if "date" in data_df.columns else None
+
+    for row in data_df.select(
+        ["latitude", "longitude"] + ([date_column] if date_column else [])
+    ).iter_rows(named=True):
+        lat = row["latitude"]
+        lon = row["longitude"]
+        obs_date = observation_date(row[date_column]) if date_column else None
+        if lat is None or lon is None:
+            nearest_stations.append(None)
+            nearest_distances.append(None)
+            continue
+
+        key = (round(float(lat), 5), round(float(lon), 5), obs_date)
+        if key not in cache:
+            candidates = []
+            for station in station_records:
+                start_date = station["start_date"]
+                end_date = station["end_date"]
+                if obs_date and start_date and obs_date < start_date:
+                    continue
+                if obs_date and end_date and obs_date > end_date:
+                    continue
+                distance = haversine_km(
+                    float(lat),
+                    float(lon),
+                    station["station_latitude"],
+                    station["station_longitude"],
+                )
+                candidates.append((station["station"], distance))
+            cache[key] = (
+                min(candidates, key=lambda item: item[1])
+                if candidates
+                else (None, None)
+            )
+
+        station_name, distance_km = cache[key]
+        nearest_stations.append(station_name)
+        nearest_distances.append(distance_km)
+
+    return data_df.with_columns(
+        [
+            pl.Series("nearest_station", nearest_stations),
+            pl.Series("nearest_station_distance_km", nearest_distances),
+        ]
+    )
+
+
 @st.cache_data(ttl="1h", max_entries=30, show_spinner=False)
 def load_dataset(cruise_names: tuple[str, ...], dataset: str) -> pl.DataFrame:
     endpoint = DATASETS[dataset]
@@ -164,7 +394,8 @@ def load_dataset(cruise_names: tuple[str, ...], dataset: str) -> pl.DataFrame:
             df = normalize_dataframe(fetch_csv(endpoint.format(cruise=cruise)))
             if dataset == "CTD bottles":
                 df = join_bottle_summary_depth(cruise, df)
-            frames.append(df)
+                df = add_temperature_property(df, bottle=True)
+            frames.append(add_nearest_station(df))
         except RuntimeError:
             continue
     return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
@@ -206,6 +437,40 @@ def add_surface_variable(
     )
 
 
+def shallowest_bottles(
+    data_df: pl.DataFrame, casts_df: pl.DataFrame
+) -> pl.DataFrame:
+    """Return one shallowest bottle per cruise/cast with cast coordinates."""
+    required = {"cruise", "cast", "depth"}
+    if data_df.is_empty() or not required.issubset(data_df.columns):
+        return pl.DataFrame()
+
+    bottles = (
+        data_df.drop_nulls(["cruise", "cast", "depth"])
+        .with_columns(pl.col("cast").cast(pl.Utf8))
+        .sort("depth")
+        .group_by(["cruise", "cast"], maintain_order=True)
+        .first()
+    )
+    cast_keys = {"cruise_name", "number", "latitude", "longitude"}
+    if not cast_keys.issubset(casts_df.columns):
+        return (
+            bottles.drop_nulls(["latitude", "longitude"])
+            if {"latitude", "longitude"}.issubset(bottles.columns)
+            else pl.DataFrame()
+        )
+    cast_locations = casts_df.select(
+        ["cruise_name", "number", "latitude", "longitude"]
+    ).rename({"cruise_name": "cruise", "number": "cast"}).with_columns(
+        pl.col("cast").cast(pl.Utf8)
+    )
+    if {"latitude", "longitude"}.issubset(bottles.columns):
+        bottles = bottles.drop(["latitude", "longitude"])
+    return bottles.join(cast_locations, on=["cruise", "cast"], how="left").drop_nulls(
+        ["latitude", "longitude"]
+    )
+
+
 def cruises_in_date_range(cruise_df: pl.DataFrame, start: date, end: date) -> list[str]:
     filtered = cruise_df.filter(
         (pl.col("start_time").dt.date() <= end)
@@ -244,28 +509,43 @@ def render_metrics(
         st.metric("Date span", date_label, border=True)
 
 
-def render_track(casts_df: pl.DataFrame, data_df: pl.DataFrame, dataset: str) -> None:
+def render_track(
+    casts_df: pl.DataFrame,
+    data_df: pl.DataFrame,
+    bottle_df: pl.DataFrame,
+    underway_df: pl.DataFrame,
+    dataset: str,
+) -> None:
     with st.container(border=True):
-        st.subheader("Cruise track, stations, and bathymetry")
-        if casts_df.is_empty() or not {"latitude", "longitude"}.issubset(
-            casts_df.columns
+        st.subheader("Underway track, stations, and bathymetry")
+        if underway_df.is_empty() or not {"latitude", "longitude"}.issubset(
+            underway_df.columns
         ):
             st.warning(
-                "No cast location data were available for the selected cruise(s)."
+                "No underway location data were available for the selected cruise(s)."
             )
-            return
+            if casts_df.is_empty() or not {"latitude", "longitude"}.issubset(
+                casts_df.columns
+            ):
+                return
+            st.info("Showing cast locations as a fallback.")
 
-        surface_variables = (
-            numeric_columns(data_df, exclude=PLOT_EXCLUDE_COLUMNS)
-            if not data_df.is_empty()
-            else []
-        )
+        underway_options = property_options(underway_df, include_cruise=True)
+        bottle_options = property_options(bottle_df) or ["Depth"]
         with st.container(horizontal=True, vertical_alignment="bottom"):
             color_choice = st.selectbox(
-                "Color stations by",
-                ["Cruise"] + surface_variables,
+                "Underway property",
+                underway_options,
+                index=temperature_property_index(underway_options),
                 key="map_surface_variable",
-                help="Surface values use the shallowest available sample for each cast/station.",
+                help="Choose the property used to color underway observations.",
+            )
+            bottle_property = st.selectbox(
+                "Shallowest bottle property",
+                bottle_options,
+                index=temperature_property_index(bottle_options),
+                key="map_bottle_property",
+                help="Choose the property used to color shallowest-bottle markers.",
             )
             show_bathymetry = st.toggle(
                 "Use ocean bathymetry basemap",
@@ -273,38 +553,60 @@ def render_track(casts_df: pl.DataFrame, data_df: pl.DataFrame, dataset: str) ->
                 key="show_bathymetry",
                 help="Uses Esri's public Ocean Basemap tiles, which include bathymetric relief.",
             )
+            show_shallowest_bottles = st.toggle(
+                "Show shallowest bottle per cast",
+                value=False,
+                key="show_shallowest_bottles",
+                help="Overlay the shallowest CTD bottle from each cast at its cast location.",
+            )
 
-        casts_plot = casts_df.drop_nulls(["latitude", "longitude"])
-        color_column = "cruise_name"
+        using_underway = not underway_df.is_empty() and {"latitude", "longitude"}.issubset(
+            underway_df.columns
+        )
+        track_df = (
+            underway_df
+            if using_underway
+            else casts_df
+        )
+        track_plot = track_df.drop_nulls(["latitude", "longitude"])
+        color_column = (
+            "cruise_name" if "cruise_name" in track_plot.columns else "cruise"
+        )
         if color_choice != "Cruise":
-            casts_plot = add_surface_variable(casts_plot, data_df, color_choice)
-            if (
-                color_choice in casts_plot.columns
-                and casts_plot.get_column(color_choice).drop_nulls().len() > 0
-            ):
+            if color_choice in track_plot.columns:
                 color_column = color_choice
             else:
+                color_column = (
+                    "cruise_name" if "cruise_name" in track_plot.columns else "cruise"
+                )
+            if (
+                color_choice in track_plot.columns
+                and track_plot.get_column(color_choice).drop_nulls().len() > 0
+            ):
+                pass
+            else:
                 st.info(
-                    f"No surface `{color_choice}` values matched these cast locations; coloring by cruise instead."
+                    f"No underway `{color_choice}` values were available; coloring by cruise instead."
                 )
 
         hover_cols = [
             c
             for c in [
+                "cruise",
                 "cruise_name",
                 "number",
+                "cast",
                 "start_time",
-                "depth",
-                "sample_depth",
+                "date",
                 color_choice,
             ]
-            if c in casts_plot.columns
+            if c in track_plot.columns
         ]
         fig = px.scatter_map(
-            casts_plot.to_pandas(),
+            track_plot.to_pandas(),
             lat="latitude",
             lon="longitude",
-            color=color_column if color_column in casts_plot.columns else None,
+            color=color_column if color_column in track_plot.columns else None,
             hover_data=hover_cols,
             color_continuous_scale="Viridis" if color_column == color_choice else None,
             zoom=6,
@@ -312,13 +614,16 @@ def render_track(casts_df: pl.DataFrame, data_df: pl.DataFrame, dataset: str) ->
             map_style="white-bg" if show_bathymetry else "open-street-map",
         )
         fig.update_traces(
-            marker={"size": 11, "opacity": 0.9}, selector={"mode": "markers"}
+            marker={"size": 6 if using_underway else 11, "opacity": 0.75},
+            selector={"mode": "markers"},
         )
 
         for cruise_name, group in (
-            casts_plot.sort(["cruise_name", "start_time"])
+            track_plot.sort(
+                [c for c in ["cruise_name", "cruise", "start_time", "date"] if c in track_plot.columns]
+            )
             .to_pandas()
-            .groupby("cruise_name")
+            .groupby("cruise_name" if "cruise_name" in track_plot.columns else "cruise")
         ):
             fig.add_trace(
                 go.Scattermap(
@@ -331,6 +636,44 @@ def render_track(casts_df: pl.DataFrame, data_df: pl.DataFrame, dataset: str) ->
                     showlegend=False,
                 )
             )
+
+        if show_shallowest_bottles:
+            bottle_plot = shallowest_bottles(bottle_df, casts_df)
+            if bottle_plot.is_empty():
+                st.info("No shallowest-bottle locations were available for this selection.")
+            else:
+                bottle_hover = [
+                    c
+                    for c in ["cruise", "cast", "niskin", "depth", bottle_property]
+                    if c in bottle_plot.columns
+                ]
+                fig.add_trace(
+                    go.Scattermap(
+                        lat=bottle_plot["latitude"].to_list(),
+                        lon=bottle_plot["longitude"].to_list(),
+                        mode="markers",
+                        marker={
+                            "size": 13,
+                            "color": (
+                                bottle_plot[bottle_property].to_list()
+                                if bottle_property in bottle_plot.columns
+                                else "#ff7f0e"
+                            ),
+                            "colorscale": "Viridis",
+                            "showscale": bottle_property in bottle_plot.columns,
+                            "opacity": 0.95,
+                            "colorbar": {"title": bottle_property},
+                        },
+                        name="Shallowest bottle",
+                        text=[
+                            "<br>".join(
+                                f"{column}: {row[column]}" for column in bottle_hover
+                            )
+                            for row in bottle_plot.select(bottle_hover).to_dicts()
+                        ],
+                        hovertemplate="%{text}<extra></extra>",
+                    )
+                )
 
         map_layout = {
             "margin": dict(l=0, r=0, t=0, b=0),
@@ -350,7 +693,7 @@ def render_track(casts_df: pl.DataFrame, data_df: pl.DataFrame, dataset: str) ->
             }
         fig.update_layout(**map_layout)
         st.caption(
-            f"Station colors use `{dataset}` surface data from the shallowest sample at each cast when a variable is selected. "
+            f"The map defaults to the underway navigation track. The orange overlay shows one shallowest `{dataset}` bottle per cast when enabled. "
             f"Bathymetry is shown with public Esri Ocean Basemap tiles when enabled."
         )
         st.plotly_chart(fig, width="stretch")
@@ -395,6 +738,11 @@ def render_section(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
                 x=alt.X(
                     f"{x_axis}:Q" if x_axis != "cast" else f"{x_axis}:N",
                     title=x_axis.replace("_", " ").title(),
+                    scale=(
+                        alt.Scale(zero=False)
+                        if x_axis in {"latitude", "longitude"}
+                        else alt.Undefined
+                    ),
                 ),
                 y=alt.Y("depth:Q", title="Depth (m)", sort="descending"),
                 color=alt.Color(
@@ -438,34 +786,70 @@ def render_profile(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
         )
         with st.container(horizontal=True, vertical_alignment="bottom"):
             profile_cruise = st.selectbox(
-                "Cruise", profile_cruises, key="profile_cruise"
+                "Profile cruise", profile_cruises, key="profile_cruise"
             )
             subset = (
                 data_df.filter(pl.col("cruise") == profile_cruise)
                 if "cruise" in data_df.columns
                 else data_df
             )
-            casts = (
-                subset.get_column("cast").cast(pl.Utf8).unique().sort().to_list()
-                if "cast" in subset.columns
+            station_column = next(
+                (
+                    column
+                    for column in ["nearest_station", "station"]
+                    if column in subset.columns
+                ),
+                None,
+            )
+            selector_options = ["Cast"] + (["Station"] if station_column else [])
+            selector_type = (
+                st.segmented_control(
+                    "Select profile by",
+                    selector_options,
+                    default="Cast",
+                    key="profile_selector_type",
+                )
+                if len(selector_options) > 1
+                else "Cast"
+            )
+            selector_column = station_column if selector_type == "Station" else "cast"
+            selector_label = f"Profile {selector_type.lower()}"
+            selector_values = (
+                subset.get_column(selector_column)
+                .cast(pl.Utf8)
+                .drop_nulls()
+                .unique()
+                .sort()
+                .to_list()
+                if selector_column in subset.columns
                 else []
             )
-            profile_cast = st.selectbox("Cast/station", casts, key="profile_cast")
+            if not selector_values:
+                st.warning(
+                    f"No {selector_type.lower()} values are available for profiles."
+                )
+                return
+            selected_profile = st.selectbox(
+                selector_label, selector_values, key="profile_selector_value"
+            )
             variables = numeric_columns(subset, exclude=PLOT_EXCLUDE_COLUMNS)
             profile_var = st.selectbox(
                 "Profile variable", variables, key="profile_variable"
             )
 
         profile_df = subset.filter(
-            pl.col("cast").cast(pl.Utf8) == str(profile_cast)
+            pl.col(selector_column).cast(pl.Utf8) == str(selected_profile)
         ).drop_nulls(["depth", profile_var])
         if profile_df.is_empty():
             st.info("No profile rows remain after applying the filters.")
             return
 
-        color_column = (
-            "replicate" if "replicate" in profile_df.columns else alt.value("#1f77b4")
-        )
+        if selector_type == "Station" and "cast" in profile_df.columns:
+            color_column = "cast"
+        elif "replicate" in profile_df.columns:
+            color_column = "replicate"
+        else:
+            color_column = alt.value("#1f77b4")
         chart = (
             alt.Chart(profile_df.sort("depth").to_pandas())
             .mark_line(point=True)
@@ -482,6 +866,8 @@ def render_profile(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
                         "cast",
                         "niskin",
                         "replicate",
+                        "nearest_station",
+                        "station",
                         "date",
                         "latitude",
                         "longitude",
@@ -549,12 +935,6 @@ with st.sidebar:
         st.caption(f"{len(selected)} cruise(s) overlap this range.")
 
     dataset = st.selectbox("Section/profile dataset", list(DATASETS), key="dataset")
-    view = st.segmented_control(
-        "View",
-        ["Cruise track", "Sections", "Profiles", "Data"],
-        default="Cruise track",
-        key="view",
-    )
 
 if not selected:
     st.info("Select at least one cruise to begin.")
@@ -566,16 +946,36 @@ summary = cruise_df.filter(pl.col("name").is_in(selected))
 with st.skeleton(height=220):
     casts_df = load_casts(selected_tuple)
 
-needs_dataset = view in {"Cruise track", "Sections", "Profiles", "Data"}
-data_df = None
-if needs_dataset:
-    with st.skeleton(height=220):
-        data_df = load_dataset(selected_tuple, dataset)
+with st.skeleton(height=220):
+    underway_df = load_underway(selected_tuple)
+
+with st.skeleton(height=220):
+    data_df = load_dataset(selected_tuple, dataset)
+
+with st.skeleton(height=220):
+    bottle_df = (
+        data_df
+        if dataset == "CTD bottles"
+        else load_dataset(selected_tuple, "CTD bottles")
+    )
 
 render_metrics(summary, casts_df, data_df, dataset)
 
+view = st.segmented_control(
+    "View",
+    ["Cruise track", "Sections", "Profiles", "Data"],
+    default="Cruise track",
+    key="view",
+)
+
 if view == "Cruise track":
-    render_track(casts_df, data_df if data_df is not None else pl.DataFrame(), dataset)
+    render_track(
+        casts_df,
+        data_df if data_df is not None else pl.DataFrame(),
+        bottle_df if bottle_df is not None else pl.DataFrame(),
+        underway_df if underway_df is not None else pl.DataFrame(),
+        dataset,
+    )
 elif view == "Sections":
     render_section(
         data_df if data_df is not None else pl.DataFrame(), dataset, selected
