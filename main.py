@@ -13,6 +13,7 @@ from dashboard.data import (
 )
 from dashboard.views import (
     render_data,
+    render_metadata,
     render_metrics,
     render_profile,
     render_section,
@@ -68,12 +69,14 @@ selected_tuple = tuple(selected)
 summary = cruise_df.filter(pl.col("name").is_in(selected))
 view = st.segmented_control(
     "View",
-    ["Cruise track", "Sections", "Profiles", "Data"],
+    ["Cruise track", "Sections", "Profiles", "Data", "Metadata"],
     default="Cruise track",
     key="view",
 )
 
-if view == "Cruise track":
+if view == "Metadata":
+    render_metadata(selected_tuple, dataset)
+elif view == "Cruise track":
     casts_df = load_casts(selected_tuple)
     underway_df = load_underway(selected_tuple)
     bottle_df = load_dataset(selected_tuple, "CTD bottles")
@@ -102,7 +105,7 @@ else:
         else load_dataset(selected_tuple, "CTD bottles")
     )
     render_metrics(summary, casts_df, data_df, dataset)
-    render_data(casts_df, data_df, bottle_df, underway_df, dataset)
+    render_data(casts_df, data_df, bottle_df, underway_df, dataset, selected_tuple)
 
 with st.expander("Selected cruises"):
     st.dataframe(

@@ -20,6 +20,11 @@ from .config import (
 )
 from .data import (
     cast_plot_data,
+    load_cruise_readme,
+    load_ctd_metadata,
+    load_dataset_readme,
+    load_raw_underway,
+    load_underway_definitions,
     numeric_columns,
     property_options,
     shallowest_bottles,
@@ -27,6 +32,100 @@ from .data import (
     temperature_property_index,
     use_endpoint_depth,
 )
+
+
+def endpoint_display(template: str, cruises: tuple[str, ...]) -> str:
+    """Show a concrete endpoint for one cruise, otherwise identify aggregation."""
+    if len(cruises) == 1:
+        return template.format(cruise=cruises[0])
+    return f"{template} ({len(cruises)} endpoints)"
+
+
+def render_metadata(cruises: tuple[str, ...], dataset: str) -> None:
+    """Render opt-in API metadata and documentation for the current selection."""
+    with st.container(border=True):
+        st.subheader("Metadata")
+        metadata_view = st.segmented_control(
+            "Metadata type",
+            [
+                "CTD metadata",
+                "Cruise documentation",
+                "Dataset documentation",
+                "Underway CSV data",
+                "Underway variable definitions",
+            ],
+            default="CTD metadata",
+            key="metadata_view_v2",
+        )
+        if metadata_view == "CTD metadata":
+            st.caption(
+                endpoint_display(f"{API_BASE}/ctd/metadata/{{cruise}}.csv", cruises)
+            )
+            metadata = load_ctd_metadata(cruises)
+            if metadata.is_empty():
+                st.info("No CTD metadata were available for the selected cruises.")
+            else:
+                st.dataframe(
+                    metadata, hide_index=True, width="stretch", key="ctd_metadata_table"
+                )
+        elif metadata_view == "Cruise documentation":
+            for cruise in cruises:
+                st.markdown(f"**{cruise}**")
+                st.caption(f"{API_BASE}/ctd/cruises/readme/{cruise}")
+                try:
+                    readme = load_cruise_readme(cruise)
+                except RuntimeError as exc:
+                    st.warning(str(exc))
+                    continue
+                st.markdown(readme or "No cruise documentation was returned.")
+        elif metadata_view == "Dataset documentation":
+            endpoint = {
+                "CTD bottles": f"{API_BASE}/ctd/cruises/readme",
+                "Nutrients": f"{API_BASE}/nut/readme",
+                "Chlorophyll": f"{API_BASE}/chl/readme",
+            }[dataset]
+            st.caption(endpoint)
+            try:
+                readme = load_dataset_readme(dataset)
+            except RuntimeError as exc:
+                st.warning(str(exc))
+            else:
+                st.markdown(readme or "No dataset documentation was returned.")
+        elif metadata_view == "Underway CSV data":
+            st.caption(endpoint_display(f"{API_BASE}/underway/{{cruise}}.csv", cruises))
+            underway = load_raw_underway(cruises)
+            if underway.is_empty():
+                st.info("No underway CSV data were available.")
+            else:
+                st.write(f"{underway.height:,} rows, {len(underway.columns):,} columns")
+                st.dataframe(
+                    underway,
+                    hide_index=True,
+                    height=650,
+                    width="stretch",
+                    key="underway_csv_table",
+                )
+        elif metadata_view == "Underway variable definitions":
+            st.caption(
+                endpoint_display(
+                    f"{API_BASE}/underway/column_definition/{{cruise}}.csv", cruises
+                )
+            )
+            definitions = load_underway_definitions(cruises)
+            if definitions.is_empty():
+                st.info("No underway column definitions were available.")
+            else:
+                st.write(
+                    f"{definitions.height:,} rows, {len(definitions.columns):,} columns"
+                )
+                st.dataframe(
+                    definitions,
+                    hide_index=True,
+                    width="stretch",
+                    key="underway_metadata_table",
+                )
+        else:
+            st.info("Select a metadata type to display.")
 
 
 def render_metrics(
@@ -402,6 +501,7 @@ def render_profile(
             subset.filter(
                 pl.col(selector_column).cast(pl.Utf8) == str(selected_profile)
             )
+            .with_columns(pl.col("depth").cast(pl.Float64, strict=False))
             .drop_nulls(["depth", profile_var])
             .sort("depth")
         )
@@ -470,17 +570,36 @@ def render_data(
     bottle_df: pl.DataFrame,
     underway_df: pl.DataFrame,
     dataset: str,
+    cruises: tuple[str, ...],
 ) -> None:
     with st.container(border=True):
         st.subheader("Loaded data")
         tables = [
-            ("Underway", underway_df, f"{API_BASE}/underway/{{cruise}}.csv"),
-            ("CTD casts", casts_df, f"{API_BASE}/ctd/cast/{{cruise}}/{{cast}}.csv"),
-            ("CTD bottles", bottle_df, f"{API_BASE}/ctd/bottles/{{cruise}}.csv"),
+            (
+                "Underway",
+                underway_df,
+                endpoint_display(f"{API_BASE}/underway/{{cruise}}.csv", cruises),
+            ),
+            (
+                "CTD casts",
+                casts_df,
+                f"{API_BASE}/ctd/cast/{{cruise}}/{{cast}}.csv (one endpoint per cast)",
+            ),
+            (
+                "CTD bottles",
+                bottle_df,
+                endpoint_display(f"{API_BASE}/ctd/bottles/{{cruise}}.csv", cruises),
+            ),
         ]
         if dataset != "CTD bottles":
             tables.append(
-                (dataset, data_df, f"{API_BASE}/{DATASET_SPECS[dataset].endpoint}")
+                (
+                    dataset,
+                    data_df,
+                    endpoint_display(
+                        f"{API_BASE}/{DATASET_SPECS[dataset].endpoint}", cruises
+                    ),
+                )
             )
         tabs = st.tabs([name for name, _, _ in tables])
         for tab, (name, table, endpoint) in zip(tabs, tables):

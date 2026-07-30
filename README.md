@@ -24,6 +24,7 @@ The default cruise is `EN617`. The API is public; no credentials are required.
 - **Sections** — depth sections by latitude, longitude, or cast, with optional local interpolation and GEBCO bathymetry masking.
 - **Profiles** — single-cast or station profiles. For CTD data, choose bottle chemistry, cast sensor data, or both. Profile tables and endpoint templates appear below each plot.
 - **Data** — loaded endpoint tables with their API sources.
+- **Metadata panel** — optional CTD metadata, cruise documentation, dataset readmes, and underway column definitions.
 
 CTD cast profiles use `ctd/cast/{cruise}/{cast}.csv`; bottle profiles use `ctd/bottles/{cruise}.csv`. Depth is taken from each selected endpoint's `depsm` field.
 

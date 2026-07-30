@@ -43,6 +43,83 @@ def fetch_csv(path: str) -> pl.DataFrame:
     )
 
 
+@st.cache_data(ttl="24h", max_entries=100, show_spinner=False)
+def fetch_text(path: str) -> str:
+    """Fetch a text or Markdown API endpoint."""
+    url = f"{API_BASE}/{path.lstrip('/')}"
+    request = Request(url, headers={"User-Agent": "nes-lter-streamlit-dashboard/0.1"})
+    try:
+        with urlopen(request, timeout=45) as response:
+            return response.read().decode("utf-8")
+    except (HTTPError, URLError, TimeoutError) as exc:
+        raise RuntimeError(f"Could not fetch {url}: {exc}") from exc
+
+
+@st.cache_data(ttl="24h", max_entries=30, show_spinner=False)
+def load_ctd_metadata(cruise_names: tuple[str, ...]) -> pl.DataFrame:
+    frames = []
+    for cruise in cruise_names:
+        try:
+            metadata = normalize_dataframe(
+                fetch_csv(f"ctd/metadata/{quote(cruise, safe='')}.csv")
+            )
+            if not metadata.is_empty():
+                frames.append(metadata.with_columns(pl.lit(cruise).alias("cruise")))
+        except RuntimeError:
+            LOGGER.warning("Unable to load CTD metadata for %s", cruise, exc_info=True)
+    return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+
+
+@st.cache_data(ttl="24h", max_entries=30, show_spinner=False)
+def load_underway_definitions(cruise_names: tuple[str, ...]) -> pl.DataFrame:
+    frames = []
+    for cruise in cruise_names:
+        try:
+            definitions = normalize_dataframe(
+                fetch_csv(f"underway/column_definition/{quote(cruise, safe='')}.csv")
+            )
+            if not definitions.is_empty():
+                frames.append(definitions.with_columns(pl.lit(cruise).alias("cruise")))
+        except RuntimeError:
+            LOGGER.warning(
+                "Unable to load underway definitions for %s", cruise, exc_info=True
+            )
+    return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+
+
+@st.cache_data(ttl="1h", max_entries=30, show_spinner=False)
+def load_raw_underway(cruise_names: tuple[str, ...]) -> pl.DataFrame:
+    """Load the raw rows returned by each underway CSV endpoint."""
+    frames = []
+    for cruise in cruise_names:
+        try:
+            raw = fetch_csv(f"underway/{quote(cruise, safe='')}.csv")
+            if not raw.is_empty():
+                frames.append(raw.with_columns(pl.lit(cruise).alias("cruise")))
+        except RuntimeError:
+            LOGGER.warning(
+                "Unable to load raw underway data for %s", cruise, exc_info=True
+            )
+    return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+
+
+@st.cache_data(ttl="24h", max_entries=30, show_spinner=False)
+def load_cruise_readme(cruise: str) -> str:
+    return fetch_text(f"ctd/cruises/readme/{quote(cruise, safe='')}")
+
+
+@st.cache_data(ttl="24h", max_entries=10, show_spinner=False)
+def load_dataset_readme(dataset: str) -> str:
+    path = {
+        "CTD bottles": "ctd/cruises/readme",
+        "Nutrients": "nut/readme",
+        "Chlorophyll": "chl/readme",
+    }.get(dataset)
+    if path is None:
+        return ""
+    return fetch_text(path)
+
+
 def normalize_dataframe(df: pl.DataFrame) -> pl.DataFrame:
     """Apply endpoint-independent datetime, numeric, and identifier types."""
     expressions = []
@@ -52,7 +129,10 @@ def normalize_dataframe(df: pl.DataFrame) -> pl.DataFrame:
                 pl.col(name).str.to_datetime(strict=False, time_zone="UTC").alias(name)
             )
         elif name not in IDENTIFIER_COLUMNS and dtype == pl.String:
-            expressions.append(pl.col(name).cast(pl.Float64, strict=False).alias(name))
+            original = df.get_column(name)
+            numeric = original.cast(pl.Float64, strict=False)
+            if numeric.null_count() == original.null_count():
+                expressions.append(pl.col(name).cast(pl.Float64).alias(name))
     normalized = df.with_columns(expressions) if expressions else df
     for name in ["cast", "number", "niskin"]:
         if name not in normalized.columns or normalized.schema[name] != pl.String:

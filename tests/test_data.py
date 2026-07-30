@@ -17,6 +17,25 @@ def test_mixed_cast_identifiers_remain_strings() -> None:
     assert result.schema["cast"] == pl.String
 
 
+def test_metadata_strings_are_not_coerced_to_null() -> None:
+    result = normalize_dataframe(
+        pl.DataFrame(
+            {
+                "Name": ["DateTime_ISO8601"],
+                "DataType": ["DateTime"],
+                "Units": ["UTC"],
+                "Comment": ["time value"],
+            }
+        )
+    )
+    assert result.to_dict(as_series=False) == {
+        "Name": ["DateTime_ISO8601"],
+        "DataType": ["DateTime"],
+        "Units": ["UTC"],
+        "Comment": ["time value"],
+    }
+
+
 def test_endpoint_depth_replaces_metadata_depth() -> None:
     result = use_endpoint_depth(
         pl.DataFrame({"depth": [10.0], "depsm": [12.5]}), "depsm"
