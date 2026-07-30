@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 from datetime import date, datetime
 from math import asin, cos, radians, sin, sqrt
+from urllib.parse import quote
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -24,7 +25,7 @@ GEBCO_OPENDAP_URL = (
     "ice_surface_elevation/netcdf/GEBCO_2026.nc"
 )
 DEPTH_SOURCE_NOTES = {
-    "CTD bottles": "Depth is added from the API's CTD bottle summary metadata (`ctd/bottle_summary/{cruise}.csv`).",
+    "CTD bottles": "Depth uses the bottle endpoint's `depsm` field.",
     "Nutrients": "Depth is provided directly by the nutrients endpoint.",
     "Chlorophyll": "Depth is provided directly by the chlorophyll endpoint.",
 }
@@ -103,7 +104,14 @@ def normalize_dataframe(df: pl.DataFrame) -> pl.DataFrame:
             )
         elif name not in IDENTIFIER_COLUMNS and dtype == pl.String:
             exprs.append(pl.col(name).cast(pl.Float64, strict=False).alias(name))
-    return df.with_columns(exprs) if exprs else df
+    normalized = df.with_columns(exprs) if exprs else df
+    for name in ["cast", "number", "niskin"]:
+        if name not in normalized.columns or normalized.schema[name] != pl.String:
+            continue
+        numeric = normalized.get_column(name).cast(pl.Int64, strict=False)
+        if numeric.null_count() == normalized.get_column(name).null_count():
+            normalized = normalized.with_columns(numeric.alias(name))
+    return normalized
 
 
 def numeric_columns(df: pl.DataFrame, exclude: set[str] | None = None) -> list[str]:
@@ -228,10 +236,64 @@ def load_casts(cruise_names: tuple[str, ...]) -> pl.DataFrame:
     frames = []
     for cruise in cruise_names:
         try:
-            frames.append(normalize_dataframe(fetch_csv(f"ctd/casts/{cruise}.csv")))
+            cast_index = normalize_dataframe(fetch_csv(f"ctd/casts/{cruise}.csv"))
+            if "number" not in cast_index.columns:
+                continue
+
+            metadata_columns = [
+                column
+                for column in [
+                    "cruise_name",
+                    "number",
+                    "latitude",
+                    "longitude",
+                    "depth",
+                    "start_time",
+                    "end_time",
+                ]
+                if column in cast_index.columns
+            ]
+            metadata = cast_index.select(metadata_columns).with_columns(
+                pl.col("number").cast(pl.Utf8)
+            )
+            for cast in (
+                cast_index.get_column("number")
+                .drop_nulls()
+                .cast(pl.Utf8)
+                .unique()
+                .to_list()
+            ):
+                try:
+                    detail = normalize_dataframe(
+                        fetch_csv(
+                            f"ctd/cast/{quote(cruise, safe='')}/"
+                            f"{quote(cast, safe='')}.csv"
+                        )
+                    )
+                except RuntimeError:
+                    continue
+                if detail.is_empty():
+                    continue
+                if "cruise" not in detail.columns:
+                    detail = detail.with_columns(pl.lit(cruise).alias("cruise"))
+                if "cast" not in detail.columns:
+                    detail = detail.with_columns(pl.lit(cast).alias("cast"))
+                detail = detail.with_columns(
+                    [
+                        pl.col("cruise").alias("cruise_name"),
+                        pl.col("cast").cast(pl.Utf8).alias("number"),
+                    ]
+                )
+                frames.append(
+                    detail.join(metadata, on=["cruise_name", "number"], how="left")
+                )
         except RuntimeError:
             continue
-    return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+    return (
+        normalize_dataframe(pl.concat(frames, how="diagonal_relaxed"))
+        if frames
+        else pl.DataFrame()
+    )
 
 
 @st.cache_data(ttl="1h", max_entries=30, show_spinner=False)
@@ -252,50 +314,15 @@ def load_underway(cruise_names: tuple[str, ...]) -> pl.DataFrame:
     return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
 
 
-def join_bottle_summary_depth(cruise: str, bottles: pl.DataFrame) -> pl.DataFrame:
-    """Add the API's canonical bottle-summary depth to the CTD bottle table.
-
-    The full CTD bottle endpoint includes Sea-Bird columns such as `depsm`, but it
-    does not expose the API's user-facing `depth` column. The metadata endpoint
-    `ctd/bottle_summary/{cruise}.csv` defines that depth per cruise/cast/niskin,
-    so we join it in and only fall back to `depsm` if the summary is unavailable.
-    """
+def use_bottle_endpoint_depth(bottles: pl.DataFrame) -> pl.DataFrame:
+    """Use the CTD bottle endpoint's own depth field for plotting."""
     if bottles.is_empty() or "depth" in bottles.columns:
         return bottles
-
-    try:
-        summary = normalize_dataframe(fetch_csv(f"ctd/bottle_summary/{cruise}.csv"))
-    except RuntimeError:
-        return (
-            bottles.with_columns(pl.col("depsm").alias("depth"))
-            if "depsm" in bottles.columns
-            else bottles
-        )
-
-    join_keys = [
-        key
-        for key in ["cruise", "cast", "niskin"]
-        if key in bottles.columns and key in summary.columns
-    ]
-    if len(join_keys) != 3 or "depth" not in summary.columns:
-        return (
-            bottles.with_columns(pl.col("depsm").alias("depth"))
-            if "depsm" in bottles.columns
-            else bottles
-        )
-
-    left = bottles.with_columns(
-        [pl.col("cast").cast(pl.Utf8), pl.col("niskin").cast(pl.Int64, strict=False)]
+    return (
+        bottles.with_columns(pl.col("depsm").alias("depth"))
+        if "depsm" in bottles.columns
+        else bottles
     )
-    right = summary.select(join_keys + ["depth"]).with_columns(
-        [pl.col("cast").cast(pl.Utf8), pl.col("niskin").cast(pl.Int64, strict=False)]
-    )
-    joined = left.join(right, on=join_keys, how="left")
-    if "depsm" in joined.columns:
-        joined = joined.with_columns(
-            pl.coalesce([pl.col("depth"), pl.col("depsm")]).alias("depth")
-        )
-    return joined
 
 
 @st.cache_data(ttl="24h", max_entries=1, show_spinner=False)
@@ -416,12 +443,38 @@ def load_dataset(cruise_names: tuple[str, ...], dataset: str) -> pl.DataFrame:
         try:
             df = normalize_dataframe(fetch_csv(endpoint.format(cruise=cruise)))
             if dataset == "CTD bottles":
-                df = join_bottle_summary_depth(cruise, df)
+                df = use_bottle_endpoint_depth(df)
                 df = add_temperature_property(df, bottle=True)
             frames.append(add_nearest_station(df))
         except RuntimeError:
             continue
     return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+
+
+def cast_plot_data(casts_df: pl.DataFrame) -> pl.DataFrame:
+    """Normalize cast-endpoint fields for section and profile plots."""
+    if casts_df.is_empty():
+        return pl.DataFrame()
+
+    expressions = []
+    if "cruise_name" in casts_df.columns:
+        expressions.append(pl.col("cruise_name").alias("cruise"))
+    if "number" in casts_df.columns:
+        expressions.append(pl.col("number").alias("cast"))
+    if "start_time" in casts_df.columns:
+        expressions.append(pl.col("start_time").alias("date"))
+    if "depsm" in casts_df.columns:
+        expressions.append(pl.col("depsm").alias("depth"))
+    elif "prdm" in casts_df.columns:
+        expressions.append(pl.col("prdm").alias("depth"))
+    return casts_df.with_columns(expressions) if expressions else casts_df
+
+
+def endpoint_depth_data(data_df: pl.DataFrame) -> pl.DataFrame:
+    """Use the selected endpoint's depth field instead of metadata depth."""
+    if data_df.is_empty() or "depsm" not in data_df.columns:
+        return data_df
+    return data_df.with_columns(pl.col("depsm").alias("depth"))
 
 
 def surface_observations(data_df: pl.DataFrame, variable: str) -> pl.DataFrame:
@@ -486,7 +539,7 @@ def shallowest_bottles(
         ["cruise_name", "number", "latitude", "longitude"]
     ).rename({"cruise_name": "cruise", "number": "cast"}).with_columns(
         pl.col("cast").cast(pl.Utf8)
-    )
+    ).unique(["cruise", "cast"])
     if {"latitude", "longitude"}.issubset(bottles.columns):
         bottles = bottles.drop(["latitude", "longitude"])
     return bottles.join(cast_locations, on=["cruise", "cast"], how="left").drop_nulls(
@@ -923,6 +976,11 @@ def render_section(
             ]
             x_axis = st.selectbox("Section x-axis", x_options, key="section_x_axis")
             variables = numeric_columns(data_df, exclude=PLOT_EXCLUDE_COLUMNS)
+            if not variables:
+                st.warning(
+                    "The selected source has no numeric property to plot."
+                )
+                return
             variable = st.selectbox("Variable", variables, key="section_variable")
             cruise_filter = st.multiselect(
                 "Cruises in section", selected, default=selected, key="section_cruises"
@@ -1084,10 +1142,43 @@ def render_section(
         st.altair_chart(chart, width="stretch")
 
 
-def render_profile(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> None:
+def render_profile(
+    data_df: pl.DataFrame,
+    dataset: str,
+    selected: list[str],
+    casts_df: pl.DataFrame,
+    bottle_df: pl.DataFrame,
+) -> None:
     with st.container(border=True):
         st.subheader(f"Single-station profiles from {dataset}")
-        st.caption(DEPTH_SOURCE_NOTES[dataset])
+        st.caption(
+            "Profile depth uses the selected CTD endpoint's `depsm` field."
+            if dataset == "CTD bottles"
+            else DEPTH_SOURCE_NOTES[dataset]
+        )
+        ctd_source = "Bottles"
+        if dataset == "CTD bottles":
+            ctd_source = st.segmented_control(
+                "CTD source",
+                ["Bottles", "Casts", "Both"],
+                default="Bottles",
+                key="profile_ctd_source",
+                help=(
+                    "Casts uses ctd/cast/{cruise}/{cast}.csv and its `depsm` depth. "
+                    "Bottles uses ctd/bottles/{cruise}.csv and its `depsm` depth."
+                ),
+            )
+            cast_data = cast_plot_data(casts_df)
+            bottle_data = endpoint_depth_data(bottle_df)
+            if ctd_source == "Casts":
+                data_df = cast_data
+            elif ctd_source == "Both":
+                data_df = pl.concat(
+                    [cast_data, bottle_data], how="diagonal_relaxed"
+                )
+            else:
+                data_df = bottle_data
+
         if data_df.is_empty() or "depth" not in data_df.columns:
             st.warning("Load a dataset with depth values to view profiles.")
             return
@@ -1129,10 +1220,10 @@ def render_profile(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
             selector_label = f"Profile {selector_type.lower()}"
             selector_values = (
                 subset.get_column(selector_column)
-                .cast(pl.Utf8)
                 .drop_nulls()
                 .unique()
                 .sort()
+                .cast(pl.Utf8)
                 .to_list()
                 if selector_column in subset.columns
                 else []
@@ -1146,6 +1237,11 @@ def render_profile(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
                 selector_label, selector_values, key="profile_selector_value"
             )
             variables = numeric_columns(subset, exclude=PLOT_EXCLUDE_COLUMNS)
+            if not variables:
+                st.warning(
+                    "The selected source has no numeric profile property."
+                )
+                return
             profile_var = st.selectbox(
                 "Profile variable", variables, key="profile_variable"
             )
@@ -1157,6 +1253,8 @@ def render_profile(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
             st.info("No profile rows remain after applying the filters.")
             return
 
+        profile_df = profile_df.sort("depth")
+
         if selector_type == "Station" and "cast" in profile_df.columns:
             color_column = "cast"
         elif "replicate" in profile_df.columns:
@@ -1164,13 +1262,14 @@ def render_profile(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
         else:
             color_column = alt.value("#1f77b4")
         chart = (
-            alt.Chart(profile_df.sort("depth").to_pandas())
+            alt.Chart(profile_df.to_pandas())
             .mark_line(point=True)
             .encode(
                 x=alt.X(
                     f"{profile_var}:Q", title=profile_var.replace("_", " ").title()
                 ),
                 y=alt.Y("depth:Q", title="Depth (m)", sort="descending"),
+                order=alt.Order("depth:Q", sort="ascending"),
                 color=color_column,
                 tooltip=[
                     c
@@ -1195,6 +1294,38 @@ def render_profile(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
         )
         st.altair_chart(chart, width="stretch")
 
+        endpoint_lines = []
+        if dataset == "CTD bottles":
+            if ctd_source in {"Bottles", "Both"}:
+                endpoint_lines.append(
+                    f"{API_BASE}/ctd/bottles/{profile_cruise}.csv"
+                )
+            if ctd_source in {"Casts", "Both"}:
+                cast_id = (
+                    str(selected_profile)
+                    if selector_type == "Cast"
+                    else "{cast}"
+                )
+                endpoint_lines.append(
+                    f"{API_BASE}/ctd/cast/{profile_cruise}/{cast_id}.csv"
+                )
+        else:
+            endpoint_lines.append(
+                f"{API_BASE}/{DATASETS[dataset].format(cruise=profile_cruise)}"
+            )
+
+        st.subheader("Profile data source")
+        st.caption("Endpoint(s) used for this plot:")
+        for endpoint in endpoint_lines:
+            st.code(endpoint)
+        st.caption(f"Rows used for this plot: {profile_df.height:,}")
+        st.dataframe(
+            profile_df,
+            hide_index=True,
+            width="stretch",
+            key="profile_plot_data_table",
+        )
+
 
 def render_data(
     casts_df: pl.DataFrame,
@@ -1206,17 +1337,40 @@ def render_data(
     with st.container(border=True):
         st.subheader("Loaded data")
         datasets = [
-            ("Underway", underway_df, None),
-            ("CTD casts", casts_df, None),
-            ("CTD bottles", bottle_df, DEPTH_SOURCE_NOTES["CTD bottles"]),
+            (
+                "Underway",
+                underway_df,
+                None,
+                f"{API_BASE}/underway/{{cruise}}.csv",
+            ),
+            (
+                "CTD casts",
+                casts_df,
+                None,
+                f"{API_BASE}/ctd/cast/{{cruise}}/{{cast}}.csv",
+            ),
+            (
+                "CTD bottles",
+                bottle_df,
+                DEPTH_SOURCE_NOTES["CTD bottles"],
+                f"{API_BASE}/ctd/bottles/{{cruise}}.csv",
+            ),
         ]
         if dataset != "CTD bottles":
-            datasets.append((dataset, data_df, DEPTH_SOURCE_NOTES[dataset]))
+            datasets.append(
+                (
+                    dataset,
+                    data_df,
+                    DEPTH_SOURCE_NOTES[dataset],
+                    f"{API_BASE}/{DATASETS[dataset]}",
+                )
+            )
 
-        tabs = st.tabs([name for name, _, _ in datasets])
-        for tab, (name, table, note) in zip(tabs, datasets):
+        tabs = st.tabs([name for name, _, _, _ in datasets])
+        for tab, (name, table, note, endpoint) in zip(tabs, datasets):
             with tab:
                 st.write(f"{name}: {table.height:,} rows")
+                st.caption(f"API endpoint: {endpoint}")
                 if note:
                     st.caption(note)
                 if table.is_empty():
@@ -1250,7 +1404,7 @@ with st.sidebar:
 
     cruise_names = cruise_df.get_column("name").to_list()
     if selection_mode == "Cruises":
-        default = [name for name in ["EN608"] if name in cruise_names] or cruise_names[
+        default = [name for name in ["EN617"] if name in cruise_names] or cruise_names[
             -1:
         ]
         selected = st.multiselect(
@@ -1322,7 +1476,11 @@ elif view == "Sections":
     )
 elif view == "Profiles":
     render_profile(
-        data_df if data_df is not None else pl.DataFrame(), dataset, selected
+        data_df if data_df is not None else pl.DataFrame(),
+        dataset,
+        selected,
+        casts_df,
+        bottle_df,
     )
 elif view == "Data":
     render_data(
