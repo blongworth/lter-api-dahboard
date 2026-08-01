@@ -359,7 +359,12 @@ def render_section(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
             if not variables:
                 st.warning("The selected source has no numeric property to plot.")
                 return
-            variable = st.selectbox("Variable", variables, key="section_variable")
+            variable = st.selectbox(
+                "Variable",
+                variables,
+                index=temperature_property_index(variables),
+                key="section_variable",
+            )
             cruises = st.multiselect(
                 "Cruises in section", selected, default=selected, key="section_cruises"
             )
@@ -554,7 +559,10 @@ def render_profile(
                 st.warning("The selected source has no numeric profile property.")
                 return
             profile_var = st.selectbox(
-                "Profile variable", variables, key="profile_variable"
+                "Profile variable",
+                variables,
+                index=temperature_property_index(variables),
+                key="profile_variable",
             )
         profile_df = (
             subset.filter(
