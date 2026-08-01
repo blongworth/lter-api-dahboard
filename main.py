@@ -9,6 +9,7 @@ from dashboard.data import (
     load_casts,
     load_cruises,
     load_dataset,
+    load_datasets,
     load_underway,
 )
 from dashboard.views import (
@@ -17,6 +18,7 @@ from dashboard.views import (
     render_metrics,
     render_profile,
     render_section,
+    render_sidebar_data_summary,
     render_track,
 )
 
@@ -33,7 +35,7 @@ except RuntimeError as exc:
     st.stop()
 
 with st.sidebar:
-    st.header("Filters")
+    st.header("Data selection")
     selection_mode = st.segmented_control(
         "Select by", ["Cruises", "Date range"], default="Cruises"
     )
@@ -57,9 +59,75 @@ with st.sidebar:
             st.stop()
         selected = cruises_in_date_range(cruise_df, *date_range)
         st.caption(f"{len(selected)} cruise(s) overlap this range.")
-    dataset = st.selectbox(
-        "Section/profile dataset", list(DATASET_SPECS), key="dataset"
-    )
+
+workspace = st.segmented_control(
+    "Workspace", ["Explore", "Inspect"], default="Explore", key="workspace"
+)
+view = st.segmented_control(
+    "View",
+    ["Cruise track", "Sections", "Profiles"]
+    if workspace == "Explore"
+    else ["Data", "Metadata"],
+    default="Cruise track" if workspace == "Explore" else "Data",
+    key="view",
+)
+
+with st.sidebar:
+    if view == "Cruise track":
+        map_source = st.selectbox(
+            "Map data source",
+            ["Underway", "CTD", "Bottles"],
+            key="map_source",
+            help="Choose the endpoint used for map locations and the track.",
+        )
+    elif view == "Sections":
+        section_datasets = tuple(
+            st.multiselect(
+                "Section data sources",
+                list(DATASET_SPECS),
+                default=["CTD bottles"],
+                key="section_datasets",
+            )
+        )
+    elif view == "Profiles":
+        profile_dataset = st.selectbox(
+            "Profile dataset",
+            list(DATASET_SPECS),
+            index=list(DATASET_SPECS).index("CTD bottles"),
+            key="profile_dataset",
+        )
+        profile_source = st.segmented_control(
+            "Profile source",
+            ["CTD", "Bottles", "Both"],
+            default="CTD",
+            key="profile_source",
+        )
+    elif view == "Data":
+        data_source = st.selectbox(
+            "Data source",
+            ["Underway", "CTD casts", *DATASET_SPECS],
+            key="data_source",
+        )
+    elif view == "Metadata":
+        metadata_dataset = st.selectbox(
+            "Dataset documentation",
+            list(DATASET_SPECS),
+            key="metadata_dataset",
+        )
+
+    st.caption(f"{len(selected)} cruise(s) selected")
+    with st.expander("Active selection"):
+        st.write(f"**Workspace:** {workspace}")
+        st.write(f"**View:** {view}")
+        if view == "Cruise track":
+            st.write(f"**Source:** {map_source}")
+        elif view == "Sections":
+            st.write(f"**Sources:** {', '.join(section_datasets) or 'None'}")
+        elif view == "Profiles":
+            st.write(f"**Dataset:** {profile_dataset}")
+            st.write(f"**Source:** {profile_source}")
+        elif view == "Data":
+            st.write(f"**Source:** {data_source}")
 
 if not selected:
     st.info("Select at least one cruise to begin.")
@@ -67,45 +135,79 @@ if not selected:
 
 selected_tuple = tuple(selected)
 summary = cruise_df.filter(pl.col("name").is_in(selected))
-view = st.segmented_control(
-    "View",
-    ["Cruise track", "Sections", "Profiles", "Data", "Metadata"],
-    default="Cruise track",
-    key="view",
-)
+
+context = " · ".join(selected_tuple)
+if view == "Cruise track":
+    context += f" · {map_source}"
+elif view == "Sections":
+    context += f" · {', '.join(section_datasets)}"
+elif view == "Profiles":
+    context += f" · {profile_dataset} · {profile_source}"
+elif view == "Data":
+    context += f" · {data_source}"
+st.caption(context)
 
 if view == "Metadata":
-    render_metadata(selected_tuple, dataset)
+    render_metadata(selected_tuple, metadata_dataset)
 elif view == "Cruise track":
     casts_df = load_casts(selected_tuple)
     underway_df = load_underway(selected_tuple)
     bottle_df = load_dataset(selected_tuple, "CTD bottles")
     render_metrics(summary, casts_df, pl.DataFrame(), "Selected data")
-    render_track(casts_df, bottle_df, underway_df, dataset)
-elif view == "Sections":
-    data_df = load_dataset(selected_tuple, dataset)
-    casts_df = load_casts(selected_tuple)
-    render_metrics(summary, casts_df, data_df, dataset)
-    render_section(data_df, dataset, selected)
-elif view == "Profiles":
-    data_df = load_dataset(selected_tuple, dataset)
-    casts_df = (
-        load_casts(selected_tuple) if dataset == "CTD bottles" else pl.DataFrame()
+    render_sidebar_data_summary(
+        [("Underway", underway_df.height), ("CTD casts", casts_df.height)]
     )
-    bottle_df = data_df if dataset == "CTD bottles" else pl.DataFrame()
-    render_metrics(summary, casts_df, data_df, dataset)
-    render_profile(data_df, dataset, selected, casts_df, bottle_df)
+    render_track(casts_df, bottle_df, underway_df, "", map_source, selected_tuple)
+elif view == "Sections":
+    if not section_datasets:
+        st.info("Select at least one section data source in the sidebar.")
+        st.stop()
+    data_df = load_datasets(selected_tuple, section_datasets)
+    casts_df = load_casts(selected_tuple)
+    section_label = ", ".join(section_datasets)
+    render_sidebar_data_summary([(section_label, data_df.height)])
+    render_metrics(summary, casts_df, data_df, section_label)
+    render_section(data_df, section_label, selected)
+elif view == "Profiles":
+    data_df = load_dataset(selected_tuple, profile_dataset)
+    casts_df = (
+        load_casts(selected_tuple)
+        if profile_dataset == "CTD bottles" and profile_source in {"CTD", "Both"}
+        else pl.DataFrame()
+    )
+    bottle_df = data_df if profile_dataset == "CTD bottles" else pl.DataFrame()
+    render_sidebar_data_summary(
+        [(profile_dataset, data_df.height), ("CTD casts", casts_df.height)]
+    )
+    render_metrics(summary, casts_df, data_df, profile_dataset)
+    render_profile(
+        data_df,
+        profile_dataset,
+        selected,
+        casts_df,
+        bottle_df,
+        profile_source,
+    )
 else:
     casts_df = load_casts(selected_tuple)
     underway_df = load_underway(selected_tuple)
-    data_df = load_dataset(selected_tuple, dataset)
+    data_df = (
+        load_underway(selected_tuple)
+        if data_source == "Underway"
+        else load_casts(selected_tuple)
+        if data_source == "CTD casts"
+        else load_dataset(selected_tuple, data_source)
+    )
     bottle_df = (
         data_df
-        if dataset == "CTD bottles"
+        if data_source == "CTD bottles"
         else load_dataset(selected_tuple, "CTD bottles")
     )
-    render_metrics(summary, casts_df, data_df, dataset)
-    render_data(casts_df, data_df, bottle_df, underway_df, dataset, selected_tuple)
+    render_sidebar_data_summary(
+        [(data_source, data_df.height), ("CTD bottles", bottle_df.height)]
+    )
+    render_metrics(summary, casts_df, data_df, data_source)
+    render_data(casts_df, data_df, bottle_df, underway_df, data_source, selected_tuple)
 
 with st.expander("Selected cruises"):
     st.dataframe(

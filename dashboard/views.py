@@ -41,6 +41,38 @@ def endpoint_display(template: str, cruises: tuple[str, ...]) -> str:
     return f"{template} ({len(cruises)} endpoints)"
 
 
+def render_plot_data(
+    data: pl.DataFrame,
+    endpoints: list[str],
+    key: str,
+    filename: str,
+) -> None:
+    """Show the source endpoints and the rows used by the current plot."""
+    st.subheader("Data used for plot")
+    for endpoint in endpoints:
+        st.code(endpoint)
+    if data.is_empty():
+        st.info("No plotted data are available.")
+        return
+    st.caption(f"{data.height:,} rows · {len(data.columns):,} columns")
+    st.download_button(
+        "Download plotted data (CSV)",
+        data=data.write_csv().encode("utf-8"),
+        file_name=filename,
+        mime="text/csv",
+        key=f"download_{key}",
+    )
+    with st.expander("Show plotted rows"):
+        st.dataframe(data, hide_index=True, width="stretch", key=f"table_{key}")
+
+
+def render_sidebar_data_summary(rows: list[tuple[str, int]]) -> None:
+    """Show compact row counts for the data loaded by the current view."""
+    with st.sidebar.expander("Loaded data"):
+        for name, count in rows:
+            st.write(f"**{name}:** {count:,} rows")
+
+
 def render_metadata(cruises: tuple[str, ...], dataset: str) -> None:
     """Render opt-in API metadata and documentation for the current selection."""
     with st.container(border=True):
@@ -153,23 +185,32 @@ def render_track(
     bottle_df: pl.DataFrame,
     underway_df: pl.DataFrame,
     dataset: str,
+    map_source: str,
+    cruises: tuple[str, ...],
 ) -> None:
     with st.container(border=True):
         st.subheader("Underway track, stations, and bathymetry")
-        valid_underway = not underway_df.is_empty() and {
+        source_data = {
+            "Underway": underway_df,
+            "CTD": casts_df,
+            "Bottles": shallowest_bottles(bottle_df, casts_df),
+        }[map_source]
+        valid_track = not source_data.is_empty() and {
             "latitude",
             "longitude",
-        }.issubset(underway_df.columns)
-        if not valid_underway:
+        }.issubset(source_data.columns)
+        if not valid_track:
             st.warning(
-                "No underway location data were available for the selected cruise(s)."
+                f"No {map_source.lower()} location data were available for the selected cruise(s)."
             )
-            if casts_df.is_empty() or not {"latitude", "longitude"}.issubset(
-                casts_df.columns
+            if underway_df.is_empty() or not {"latitude", "longitude"}.issubset(
+                underway_df.columns
             ):
                 return
-            st.info("Showing cast locations as a fallback.")
-        underway_options = property_options(underway_df, include_cruise=True)
+            st.info("Showing underway locations as a fallback.")
+        underway_options = property_options(underway_df, include_cruise=True) or [
+            "Cruise"
+        ]
         bottle_options = property_options(bottle_df) or ["Depth"]
         with st.container(horizontal=True, vertical_alignment="bottom"):
             color_choice = st.selectbox(
@@ -190,7 +231,7 @@ def render_track(
             show_bottles = st.toggle(
                 "Show shallowest bottle per cast", False, key="show_shallowest_bottles"
             )
-        track = underway_df if valid_underway else casts_df
+        track = source_data if valid_track else underway_df
         track = track.drop_nulls(["latitude", "longitude"])
         color_column = "cruise_name" if "cruise_name" in track.columns else "cruise"
         if color_choice != "Cruise" and color_choice in track.columns:
@@ -218,7 +259,7 @@ def render_track(
             map_style="white-bg" if show_bathymetry else "open-street-map",
         )
         fig.update_traces(
-            marker={"size": 6 if valid_underway else 11, "opacity": 0.75},
+            marker={"size": 6 if map_source == "Underway" else 11, "opacity": 0.75},
             selector={"mode": "markers"},
         )
         group_column = "cruise_name" if "cruise_name" in track.columns else "cruise"
@@ -285,12 +326,25 @@ def render_track(
             margin={"l": 0, "r": 0, "t": 0, "b": 0}, legend={"orientation": "h"}
         )
         st.plotly_chart(fig, width="stretch")
+        endpoint_template = {
+            "Underway": f"{API_BASE}/underway/{{cruise}}.csv",
+            "CTD": f"{API_BASE}/ctd/casts/{{cruise}}.csv",
+            "Bottles": f"{API_BASE}/ctd/bottles/{{cruise}}.csv",
+        }[map_source]
+        render_plot_data(
+            track,
+            [endpoint_template.format(cruise=cruise) for cruise in cruises],
+            "map_plot",
+            "nes_lter_map_data.csv",
+        )
 
 
 def render_section(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> None:
+    dataset_names = [name for name in DATASET_SPECS if name in dataset.split(", ")]
+    dataset_names = dataset_names or [next(iter(DATASET_SPECS))]
     with st.container(border=True):
         st.subheader(f"Sections from {dataset}")
-        st.caption(DATASET_SPECS[dataset].depth_note)
+        st.caption("; ".join(DATASET_SPECS[name].depth_note for name in dataset_names))
         if data_df.is_empty() or "depth" not in data_df.columns:
             st.warning(f"No {dataset} data with depth were available.")
             return
@@ -403,6 +457,17 @@ def render_section(data_df: pl.DataFrame, dataset: str, selected: list[str]) -> 
         st.altair_chart(
             alt.layer(*layers).interactive().properties(height=620), width="stretch"
         )
+        endpoints = [
+            f"{API_BASE}/{DATASET_SPECS[name].endpoint.format(cruise=cruise)}"
+            for name in dataset_names
+            for cruise in (cruises or selected)
+        ]
+        render_plot_data(
+            section_df,
+            endpoints,
+            "section_plot",
+            "nes_lter_section_data.csv",
+        )
 
 
 def render_profile(
@@ -411,23 +476,17 @@ def render_profile(
     selected: list[str],
     casts_df: pl.DataFrame,
     bottle_df: pl.DataFrame,
+    profile_source: str = "Bottles",
 ) -> None:
     with st.container(border=True):
         st.subheader(f"Single-station profiles from {dataset}")
-        source = "Bottles"
+        source = profile_source
         if dataset == "CTD bottles":
-            source = st.segmented_control(
-                "CTD source",
-                ["Bottles", "Casts", "Both"],
-                default="Bottles",
-                key="profile_ctd_source",
-                help="Casts uses ctd/cast/{cruise}/{cast}.csv and depsm; bottles uses ctd/bottles/{cruise}.csv and depsm.",
-            )
             cast_data = cast_plot_data(casts_df)
             bottle_data = use_endpoint_depth(bottle_df, "depsm")
             data_df = (
                 cast_data
-                if source == "Casts"
+                if source == "CTD"
                 else pl.concat([cast_data, bottle_data], how="diagonal_relaxed")
                 if source == "Both"
                 else bottle_data
@@ -548,7 +607,7 @@ def render_profile(
         if dataset == "CTD bottles":
             if source in {"Bottles", "Both"}:
                 endpoint_lines.append(f"{API_BASE}/ctd/bottles/{cruise}.csv")
-            if source in {"Casts", "Both"}:
+            if source in {"CTD", "Both"}:
                 endpoint_lines.append(
                     f"{API_BASE}/ctd/cast/{cruise}/{selected_profile if selector_type == 'Cast' else '{cast}'}.csv"
                 )
@@ -556,11 +615,11 @@ def render_profile(
             endpoint_lines.append(
                 f"{API_BASE}/{DATASET_SPECS[dataset].endpoint.format(cruise=cruise)}"
             )
-        for endpoint in endpoint_lines:
-            st.code(endpoint)
-        st.caption(f"Rows used for this plot: {profile_df.height:,}")
-        st.dataframe(
-            profile_df, hide_index=True, width="stretch", key="profile_plot_data_table"
+        render_plot_data(
+            profile_df,
+            endpoint_lines,
+            "profile_plot",
+            "nes_lter_profile_data.csv",
         )
 
 
@@ -591,7 +650,7 @@ def render_data(
                 endpoint_display(f"{API_BASE}/ctd/bottles/{{cruise}}.csv", cruises),
             ),
         ]
-        if dataset != "CTD bottles":
+        if dataset in DATASET_SPECS and dataset != "CTD bottles":
             tables.append(
                 (
                     dataset,

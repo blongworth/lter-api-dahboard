@@ -497,6 +497,18 @@ def load_dataset(cruise_names: tuple[str, ...], dataset: str) -> pl.DataFrame:
     )
 
 
+def load_datasets(
+    cruise_names: tuple[str, ...], datasets: tuple[str, ...]
+) -> pl.DataFrame:
+    """Load and combine multiple compatible depth-oriented datasets."""
+    frames = []
+    for dataset in datasets:
+        data = load_dataset(cruise_names, dataset)
+        if not data.is_empty():
+            frames.append(data.with_columns(pl.lit(dataset).alias("data_source")))
+    return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+
+
 def cast_plot_data(df: pl.DataFrame) -> pl.DataFrame:
     if df.is_empty():
         return df
